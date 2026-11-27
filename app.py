@@ -1,10 +1,13 @@
 import io
+import os
 import re
+import tempfile
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
+import gdown
 import openpyxl
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
@@ -13,7 +16,7 @@ from pypdf import PdfReader
 import streamlit as st
 
 # ==========================================
-# PAGE CONFIGURATION & SPEED CSS
+# PAGE CONFIGURATION
 # ==========================================
 st.set_page_config(
     page_title="Invoice PDF to Excel Extractor (Turbo)",
@@ -21,25 +24,9 @@ st.set_page_config(
     layout="wide",
 )
 
-# Keeps file uploader fast even when 100+ PDFs are selected
-st.markdown(
-    """
-    <style>
-    [data-testid="stFileUploader"] ul {
-        max-height: 120px;
-        overflow-y: auto;
-        border: 1px solid #e0e0e0;
-        border-radius: 6px;
-        padding: 4px;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
 st.title("⚡ Building Material Invoice PDF to Excel Extractor")
 st.caption(
-    "Turbo Upload • Zero API Key • Single Master Sheet (Invoice Summary + Challan Details) • Missing Invoice Alert"
+    "Google Drive Fast Import • Zero API Key • Single Master Sheet • Missing Invoice Alert"
 )
 
 # ==========================================
@@ -263,7 +250,6 @@ def parse_pdf_invoice(
             if not s or re.search(r"VEHIC|CH\.?\s*NO|METAL\s+TON", s, re.IGNORECASE):
                 continue
 
-            # Layout B1: Date + Vehicle + [Optional CH.NO] + Metal + TON + Rate + Amount
             m_full = re.match(
                 rf"^(?:\d+\s{{2,}})?({DATE_PAT})\s+({VEH_PAT})\s+(?:(\d+[A-Za-z0-9/\-]*)(?!\s*MM\b)\s+)?(.+?)\s+({NUM_PAT})\s+({NUM_PAT})\s+({NUM_PAT})$",
                 s,
@@ -286,7 +272,6 @@ def parse_pdf_invoice(
                 )
                 continue
 
-            # Layout B2: Vehicle + Date + [Optional CH.NO] + Metal + TON + Rate + Amount
             m_full_rev = re.match(
                 rf"^(?:\d+\s{{2,}})?({VEH_PAT})\s+({DATE_PAT})\s+(?:(\d+[A-Za-z0-9/\-]*)(?!\s*MM\b)\s+)?(.+?)\s+({NUM_PAT})\s+({NUM_PAT})\s+({NUM_PAT})$",
                 s,
@@ -309,7 +294,6 @@ def parse_pdf_invoice(
                 )
                 continue
 
-            # Layout A: Summary line -> Metal + TON + Rate + Amount
             m_sum = re.match(
                 rf"^(.+?)\s+({NUM_PAT})\s+({NUM_PAT})\s+({NUM_PAT})$",
                 s,
@@ -332,7 +316,7 @@ def parse_pdf_invoice(
                     }
                 )
 
-    # 6. Extract Page 2+ Challan / Dispatch Table (if present)
+    # 6. Extract Page 2+ Challan / Dispatch Table
     p2_dispatch_rows: List[dict] = []
     for page in reader.pages[1:]:
         p_text = page.extract_text(extraction_mode="layout") or ""
@@ -473,7 +457,36 @@ def parse_pdf_invoice(
     return combined_rows
 
 
-def extract_pdfs_from_uploads(uploaded_files):
+# ==========================================
+# FAST FILE LOADERS (GOOGLE DRIVE & UPLOAD)
+# ==========================================
+def download_from_gdrive(url: str) -> List[Tuple[str, bytes]]:
+    """Downloads a ZIP or PDF from Google Drive server-to-server in 1-2 seconds."""
+    pdf_list = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_path = gdown.download(url=url.strip(), output=os.path.join(tmpdir, "downloaded_file"), quiet=True, fuzzy=True)
+        if not out_path or not os.path.exists(out_path):
+            raise ValueError("Google Drive se file download nahi ho payi. Check karein ki link 'Anyone with the link' par set hai.")
+
+        with open(out_path, "rb") as f:
+            raw_bytes = f.read()
+
+        # Check if ZIP file (magic bytes PK)
+        if raw_bytes[:2] == b"PK":
+            with zipfile.ZipFile(io.BytesIO(raw_bytes)) as zf:
+                for zname in zf.namelist():
+                    if zname.lower().endswith(".pdf") and not zname.startswith("__MACOSX"):
+                        clean_name = zname.split("/")[-1]
+                        if clean_name:
+                            pdf_list.append((clean_name, zf.read(zname)))
+        elif raw_bytes[:4] == b"%PDF":
+            pdf_list.append((os.path.basename(out_path) + ".pdf", raw_bytes))
+        else:
+            raise ValueError("Downloaded file valid ZIP ya PDF nahi hai. Kripya direct file share link dein.")
+    return pdf_list
+
+
+def extract_pdfs_from_uploads(uploaded_files) -> List[Tuple[str, bytes]]:
     pdf_list = []
     for f in uploaded_files:
         name = f.name
@@ -488,6 +501,86 @@ def extract_pdfs_from_uploads(uploaded_files):
         elif name.lower().endswith(".pdf"):
             pdf_list.append((name, raw_bytes))
     return pdf_list
+
+
+def process_pdf_batch(
+    pdf_items: List[Tuple[str, bytes]],
+    default_company_info: Dict[str, str],
+    overwrite_duplicates: bool,
+):
+    total_pdfs = len(pdf_items)
+    if total_pdfs == 0:
+        st.warning("Koi valid PDF file nahi mili.")
+        return
+
+    existing_bills = set()
+    if not st.session_state.master_df.empty and "Bill No" in st.session_state.master_df.columns:
+        existing_bills = set(st.session_state.master_df["Bill No"].astype(str).str.strip())
+
+    new_rows = []
+    added_bills_count = 0
+    skipped_files = []
+    error_files = []
+
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    parsed_results = []
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {
+            executor.submit(parse_pdf_invoice, fbytes, fname, default_company_info): fname
+            for fname, fbytes in pdf_items
+        }
+        for done_idx, future in enumerate(as_completed(futures), start=1):
+            fname = futures[future]
+            try:
+                parsed_results.append((fname, future.result(), None))
+            except Exception as e:
+                parsed_results.append((fname, None, str(e)))
+            progress_bar.progress(done_idx / total_pdfs)
+            status_text.text(f"Extracted {done_idx}/{total_pdfs} files...")
+
+    status_text.empty()
+    progress_bar.empty()
+
+    parsed_results.sort(key=lambda x: x[0])
+
+    for fname, invoice_rows, err in parsed_results:
+        if err:
+            error_files.append(f"{fname}: {err}")
+            continue
+
+        bill_no_str = str(invoice_rows[0]["Bill No"]).strip()
+        if bill_no_str in existing_bills and not overwrite_duplicates:
+            skipped_files.append(f"{fname} (Bill No: {bill_no_str})")
+        else:
+            if bill_no_str in existing_bills and overwrite_duplicates:
+                st.session_state.master_df = st.session_state.master_df[
+                    st.session_state.master_df["Bill No"].astype(str).str.strip() != bill_no_str
+                ]
+            new_rows.extend(invoice_rows)
+            existing_bills.add(bill_no_str)
+            added_bills_count += 1
+
+    if new_rows:
+        new_df = pd.DataFrame(new_rows)
+        st.session_state.master_df = pd.concat(
+            [st.session_state.master_df, new_df], ignore_index=True
+        )
+        if "Bill No (Num)" in st.session_state.master_df.columns:
+            st.session_state.master_df = st.session_state.master_df.sort_values(
+                by="Bill No (Num)", ascending=True, kind="mergesort"
+            ).reset_index(drop=True)
+
+        st.success(f"✅ {added_bills_count} naye invoice ({len(new_rows)} rows) turbo speed se add ho gaye!")
+
+    if skipped_files:
+        st.info("⏭️ Duplicate invoices skip kiye gaye: " + ", ".join(skipped_files))
+
+    if error_files:
+        with st.expander(f"⚠️ {len(error_files)} files me issue aaya (click karke dekhein)"):
+            for err in error_files:
+                st.write(err)
 
 
 def find_missing_invoices(master_df: pd.DataFrame) -> pd.DataFrame:
@@ -604,103 +697,57 @@ with st.sidebar:
         st.rerun()
 
 # ==========================================
-# MAIN AREA: TURBO FORM UPLOAD (ZIP OR PDFs)
+# MAIN AREA: 2 UPLOAD OPTIONS (GDRIVE + DIRECT)
 # ==========================================
-st.subheader("2️⃣ Fast Invoice Upload")
-st.info("🚀 **Fastest Tip (100+ files ke liye):** Saari PDFs select karke **Right-Click → Compress to ZIP** karein aur sirf 1 `.zip` file upload karein — 2 second me upload hogi!")
+st.subheader("2️⃣ Invoices Upload Karein")
 
-with st.form("invoice_upload_form", clear_on_submit=True):
-    uploaded_files = st.file_uploader(
-        "1 ZIP file (Fastest) ya Multiple PDFs select karein",
-        type=["zip", "pdf"],
-        accept_multiple_files=True,
+upload_tab1, upload_tab2 = st.tabs(
+    ["🚀 Google Drive Link (Fastest — 100+ PDFs in 2 Sec)", "📁 Direct Upload (Chhote Batches ke liye)"]
+)
+
+with upload_tab1:
+    st.caption(
+        "Saari PDFs ko ZIP banakar Google Drive par upload karein → Share → 'Anyone with the link' → Link yahan paste karein."
     )
-    extract_clicked = st.form_submit_button(
-        "⚡ Extract & Update Excel Data",
-        type="primary",
-        use_container_width=True,
-    )
+    with st.form("gdrive_form", clear_on_submit=True):
+        gdrive_url = st.text_input(
+            "Google Drive ZIP / PDF Link paste karein",
+            placeholder="https://drive.google.com/file/d/xxxxxxxxxxxx/view?usp=sharing",
+        )
+        gdrive_clicked = st.form_submit_button(
+            "⚡ Fetch from Google Drive & Extract",
+            type="primary",
+            use_container_width=True,
+        )
 
-if extract_clicked and uploaded_files:
-    with st.spinner("Files unpack ho rahi hain..."):
-        pdf_items = extract_pdfs_from_uploads(uploaded_files)
+    if gdrive_clicked:
+        if not gdrive_url.strip():
+            st.error("Kripya Google Drive ka link paste karein.")
+        else:
+            try:
+                with st.spinner("Google Drive se file fetch ho rahi hai (1-2 sec)..."):
+                    pdf_items = download_from_gdrive(gdrive_url)
+                process_pdf_batch(pdf_items, default_company_info, overwrite_duplicates)
+            except Exception as e:
+                st.error(f"❌ Error: {e}")
 
-    total_pdfs = len(pdf_items)
-    if total_pdfs == 0:
-        st.warning("Koi valid PDF file nahi mili.")
-    else:
-        existing_bills = set()
-        if not st.session_state.master_df.empty and "Bill No" in st.session_state.master_df.columns:
-            existing_bills = set(st.session_state.master_df["Bill No"].astype(str).str.strip())
+with upload_tab2:
+    with st.form("direct_upload_form", clear_on_submit=True):
+        uploaded_files = st.file_uploader(
+            "1 ZIP file ya kam PDFs (1–15 files) select karein",
+            type=["zip", "pdf"],
+            accept_multiple_files=True,
+        )
+        direct_clicked = st.form_submit_button(
+            "⚡ Extract & Update Excel Data",
+            type="primary",
+            use_container_width=True,
+        )
 
-        new_rows = []
-        added_bills_count = 0
-        skipped_files = []
-        error_files = []
-
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-
-        # Parallel extraction using ThreadPoolExecutor
-        parsed_results = []
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            futures = {
-                executor.submit(parse_pdf_invoice, fbytes, fname, default_company_info): fname
-                for fname, fbytes in pdf_items
-            }
-            for done_idx, future in enumerate(as_completed(futures), start=1):
-                fname = futures[future]
-                try:
-                    parsed_results.append((fname, future.result(), None))
-                except Exception as e:
-                    parsed_results.append((fname, None, str(e)))
-                progress_bar.progress(done_idx / total_pdfs)
-                status_text.text(f"Extracted {done_idx}/{total_pdfs} files...")
-
-        status_text.empty()
-        progress_bar.empty()
-
-        # Sort by filename for consistent duplicate handling
-        parsed_results.sort(key=lambda x: x[0])
-
-        for fname, invoice_rows, err in parsed_results:
-            if err:
-                error_files.append(f"{fname}: {err}")
-                continue
-
-            bill_no_str = str(invoice_rows[0]["Bill No"]).strip()
-            if bill_no_str in existing_bills and not overwrite_duplicates:
-                skipped_files.append(f"{fname} (Bill No: {bill_no_str})")
-            else:
-                if bill_no_str in existing_bills and overwrite_duplicates:
-                    st.session_state.master_df = st.session_state.master_df[
-                        st.session_state.master_df["Bill No"].astype(str).str.strip() != bill_no_str
-                    ]
-                new_rows.extend(invoice_rows)
-                existing_bills.add(bill_no_str)
-                added_bills_count += 1
-
-        if new_rows:
-            new_df = pd.DataFrame(new_rows)
-            st.session_state.master_df = pd.concat(
-                [st.session_state.master_df, new_df], ignore_index=True
-            )
-            if "Bill No (Num)" in st.session_state.master_df.columns:
-                st.session_state.master_df = st.session_state.master_df.sort_values(
-                    by="Bill No (Num)", ascending=True, kind="mergesort"
-                ).reset_index(drop=True)
-
-            st.success(
-                f"✅ {added_bills_count} naye invoice ({len(new_rows)} rows) turbo speed se add ho gaye!"
-            )
-
-        if skipped_files:
-            st.info("⏭️ Duplicate invoices skip kiye gaye: " + ", ".join(skipped_files))
-
-        if error_files:
-            with st.expander(f"⚠️ {len(error_files)} files me issue aaya (click karke dekhein)"):
-                for err in error_files:
-                    st.write(err)
+    if direct_clicked and uploaded_files:
+        with st.spinner("Files unpack ho rahi hain..."):
+            pdf_items = extract_pdfs_from_uploads(uploaded_files)
+        process_pdf_batch(pdf_items, default_company_info, overwrite_duplicates)
 
 # ==========================================
 # DASHBOARD, MISSING INVOICE ALERT & EXPORT
