@@ -1,6 +1,4 @@
 [server]
 maxUploadSize = 500
-enableWebsocketCompression = true
-
-[runner]
-fastReruns = true
+enableWebsocketCompression = false
+enableXsrfProtection = false
