@@ -1,85 +1,51 @@
 import io
 import re
 import zipfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import openpyxl
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 import pandas as pd
-from pydantic import BaseModel, Field
+from pypdf import PdfReader
 import streamlit as st
-from google import genai
-from google.genai import types
 
 # ==========================================
 # PAGE CONFIGURATION
 # ==========================================
 st.set_page_config(
-    page_title="Invoice PDF to Excel Extractor",
-    page_icon="📄",
+    page_title="Invoice PDF to Excel Extractor (Fast)",
+    page_icon="⚡",
     layout="wide",
 )
 
-st.title("📄 Building Material Invoice PDF to Excel Extractor")
+st.title("⚡ Building Material Invoice PDF to Excel Extractor")
 st.caption(
-    "Multiple Invoice PDFs ya ek ZIP file upload karein, purane Master Excel me naya data append karein, aur missing invoices ka alert payein."
+    "Zero API Key • Zero Rate Limit • 100+ PDFs seconds me extract karein, purane Master Excel me append karein, aur missing invoices ka alert payein."
 )
 
 # ==========================================
-# PYDANTIC SCHEMA FOR STRUCTURED EXTRACTION
+# REGEX PATTERNS & HELPERS
 # ==========================================
-class MetalRateItem(BaseModel):
-    metal_type: str = Field(description="Metal/Product name e.g., 10 MM, 20 MM, C. SAND")
-    total_ton: Optional[float] = Field(default=None, description="Total TON for this metal")
-    rate: Optional[float] = Field(default=None, description="Rate per TON")
-    amount: Optional[float] = Field(default=None, description="Amount for this metal")
+DATE_PAT = r"(?:\d{1,2}[-/\.](?:[A-Za-z]{3,9}|\d{1,2})[-/\.]\d{2,4})"
+NUM_PAT = r"\d+(?:,\d+)*(?:\.\d+)?"
+VEH_PAT = r"[A-Z]{2}\s*-?\s*\d{1,2}\s*-?\s*[A-Z]{1,3}\s*-?\s*\d{1,4}"
 
 
-class DispatchItem(BaseModel):
-    sr_no: Optional[str] = Field(default="", description="Serial number of dispatch row")
-    dispatch_date: Optional[str] = Field(default="", description="Date material was sent in DD/MM/YYYY format")
-    challan_no: Optional[str] = Field(default="", description="Challan or slip number if available")
-    vehicle_no: Optional[str] = Field(default="", description="Vehicle number e.g., MH04 MH 0777")
-    metal_type: str = Field(description="Metal type e.g., 10 MM, 20 MM, C. SAND")
-    ton: float = Field(description="Weight in TON")
-    rate: Optional[float] = Field(default=None, description="Rate per TON if mentioned on this row")
-    amount: Optional[float] = Field(default=None, description="Amount if mentioned on this row")
+def parse_date_ddmmyyyy(raw: str) -> str:
+    if not raw:
+        return ""
+    s = raw.strip().replace(".", "-").replace("/", "-")
+    for fmt in ("%d-%m-%Y", "%d-%m-%y", "%d-%b-%y", "%d-%b-%Y", "%d-%B-%y", "%d-%B-%Y"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            return dt.strftime("%d/%m/%Y")
+        except ValueError:
+            continue
+    return raw.strip()
 
 
-class InvoiceData(BaseModel):
-    company_name: str = Field(description="Supplier company name from header")
-    company_gstin: Optional[str] = Field(default="", description="Supplier GSTIN")
-    company_pan: Optional[str] = Field(default="", description="Supplier PAN")
-    company_details: Optional[str] = Field(default="", description="Supplier address, contact person, phone numbers")
-    bill_no: str = Field(description="Invoice / Bill number e.g., 01, 04")
-    invoice_date: str = Field(description="Invoice date formatted as DD/MM/YYYY")
-    bill_to_name: str = Field(description="Customer name under Bill To")
-    bill_to_address: Optional[str] = Field(default="", description="Customer billing address")
-    shipping_address: Optional[str] = Field(default="", description="Shipping address if mentioned, else blank")
-    customer_gst_pan: Optional[str] = Field(default="", description="Customer GST No or PAN No")
-    customer_state: str = Field(description="Customer State name, corrected spelling e.g., Maharashtra")
-    hsn_code: Optional[str] = Field(default="", description="HSN Code e.g., 2517")
-    round_off: Optional[float] = Field(default=0.0, description="Round off amount if shown")
-    summary_rates: List[MetalRateItem] = Field(
-        default_factory=list,
-        description="Summary table of Metal types and their Rates from Page 1",
-    )
-    dispatch_items: List[DispatchItem] = Field(
-        default_factory=list,
-        description=(
-            "All individual vehicle/date/metal delivery rows. "
-            "If invoice has a 2nd page challan table, extract every row from Page 2. "
-            "If vehicle/date/metal rows are inside Page 1 invoice table directly, extract every row from Page 1."
-        ),
-    )
-
-
-# ==========================================
-# HELPER FUNCTIONS
-# ==========================================
 def normalize_state(state_str: str) -> str:
     if not state_str:
         return ""
@@ -93,6 +59,10 @@ def normalize_metal(metal_str: str) -> str:
     if not metal_str:
         return ""
     return re.sub(r"\s+", " ", metal_str.strip().upper())
+
+
+def to_float(val: str) -> float:
+    return float(str(val).replace(",", "").strip())
 
 
 def extract_bill_number_int(bill_no: str) -> Optional[int]:
@@ -115,137 +85,304 @@ def get_financial_year(date_str: str) -> str:
     return ""
 
 
-def parse_invoice_with_gemini(pdf_bytes: bytes, api_key: str, model_name: str) -> InvoiceData:
-    client = genai.Client(api_key=api_key)
-    prompt = """
-    Extract all structured invoice data from this PDF accurately.
-    Important rules:
-    1. Convert all dates (Invoice Date and Dispatch Dates) strictly to DD/MM/YYYY format (e.g., 7/4/2026 -> 07/04/2026, 27-Mar-26 -> 27/03/2026).
-    2. Normalize state spelling (e.g., 'Maharastra.' -> 'Maharashtra').
-    3. Look carefully at the layout:
-       - Layout A (2-page invoice): Page 1 has summary rates by metal (10 MM, 20 MM, C. SAND), and Page 2 has the full Challan/Dispatch table (Sr.No., Date, Challan No, Vehicle No, Metal, TON). Extract Page 1 rates into `summary_rates` and ALL Page 2 rows into `dispatch_items`.
-       - Layout B (1-page invoice): Page 1's main table directly contains Date, Vehicle No, Metal, TON, Rate, Amount for each delivery. Extract ALL rows into `dispatch_items` (and also capture unique metal rates in `summary_rates`).
-    4. Watch for wrapped text in date/sr.no cells on Page 2 (e.g., '-Apr-26 3 24' means Sr No 24, Date 03/04/2026).
-    5. Do not skip any dispatch row.
-    """
+# ==========================================
+# DIRECT PYTHON PDF PARSER (NO API)
+# ==========================================
+def parse_pdf_invoice(
+    pdf_bytes: bytes,
+    source_filename: str,
+    default_company_info: Dict[str, str],
+) -> Tuple[dict, List[dict]]:
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    if not reader.pages:
+        raise ValueError("PDF me koi page nahi mila.")
 
-    response = client.models.generate_content(
-        model=model_name,
-        contents=[
-            types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"),
-            prompt,
-        ],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=InvoiceData,
-            temperature=0.0,
-        ),
-    )
-    return InvoiceData.model_validate_json(response.text)
+    p1_text = reader.pages[0].extract_text(extraction_mode="layout") or ""
+    if not p1_text.strip():
+        raise ValueError("Is PDF me readable text nahi hai (ye scanned image PDF ho sakta hai).")
 
+    p1_lines = p1_text.splitlines()
 
-def process_extracted_invoice(inv: InvoiceData, source_filename: str):
-    state = normalize_state(inv.customer_state)
-    is_maharashtra = state.lower() == "maharashtra"
-    fy = get_financial_year(inv.invoice_date)
-    bill_num_int = extract_bill_number_int(inv.bill_no)
-    bill_no_clean = str(inv.bill_no).strip()
+    # 1. Bill No & Invoice Date
+    bill_no = ""
+    invoice_date = ""
+    for line in p1_lines:
+        if not bill_no:
+            m_bill = re.search(r"Bill\s*No\.?\s*[:\-]?\s*([A-Za-z0-9/\-]+)", line, re.IGNORECASE)
+            if m_bill:
+                bill_no = m_bill.group(1).strip()
+        if not invoice_date:
+            m_date = re.search(r"Date\s*[:\-]?\s*(" + DATE_PAT + r")", line, re.IGNORECASE)
+            if m_date:
+                invoice_date = parse_date_ddmmyyyy(m_date.group(1))
 
-    rate_map = {}
-    for item in inv.summary_rates:
-        if item.rate is not None:
-            rate_map[normalize_metal(item.metal_type)] = float(item.rate)
+    # Fallback Bill No from filename if not found in text
+    if not bill_no:
+        m_fn = re.match(r"^\s*(\d+)", source_filename)
+        if m_fn:
+            bill_no = m_fn.group(1)
+
+    # 2. Bill To & Shipping Address (column-based split)
+    bill_to_idx = None
+    gst_idx = None
+    ship_col = None
+    for idx, line in enumerate(p1_lines):
+        if bill_to_idx is None and re.search(r"Bill\s*To", line, re.IGNORECASE):
+            bill_to_idx = idx
+        if gst_idx is None and re.search(r"GST\s*NO", line, re.IGNORECASE):
+            gst_idx = idx
+            break
+
+    bill_to_lines = []
+    shipping_lines = []
+    if bill_to_idx is not None and gst_idx is not None:
+        for line in p1_lines[bill_to_idx:gst_idx]:
+            m_ship = re.search(r"Shipping\s*Ad+ress?\s*[:\-]?", line, re.IGNORECASE)
+            if m_ship:
+                ship_col = m_ship.start()
+                after_label = line[m_ship.end() :].strip()
+                if after_label:
+                    shipping_lines.append(after_label)
+                break
+
+        for line in p1_lines[bill_to_idx + 1 : gst_idx]:
+            if not line.strip():
+                continue
+            if ship_col is not None and len(line) > ship_col:
+                left_part = line[:ship_col].strip()
+                right_part = line[ship_col:].strip()
+                right_part = re.sub(
+                    r"^Shipping\s*Ad+ress?\s*[:\-]?\s*", "", right_part, flags=re.IGNORECASE
+                ).strip()
+                if left_part:
+                    bill_to_lines.append(left_part)
+                if right_part:
+                    shipping_lines.append(right_part)
+            else:
+                left_part = re.sub(
+                    r"Shipping\s*Ad+ress?\s*[:\-]?.*$", "", line, flags=re.IGNORECASE
+                ).strip()
+                if left_part:
+                    bill_to_lines.append(left_part)
+
+    bill_to_name = bill_to_lines[0] if bill_to_lines else ""
+    bill_to_address = ", ".join(bill_to_lines[1:]) if len(bill_to_lines) > 1 else ""
+    shipping_address = ", ".join(shipping_lines)
+
+    # 3. Customer GST/PAN & State
+    customer_gst_pan = ""
+    customer_state = ""
+    if gst_idx is not None:
+        gst_line = p1_lines[gst_idx]
+        parts = re.split(r"\s{4,}", gst_line.strip())
+        if parts:
+            left_gst = re.sub(
+                r"^GST\s*NO\.?\s*/?\s*PAN\s*NO\.?\s*[:\-]*\s*", "", parts[0], flags=re.IGNORECASE
+            ).strip()
+            left_gst = re.sub(
+                r"^(?:GST|PAN)\s*No\.?\s*[:\-]*\s*", "", left_gst, flags=re.IGNORECASE
+            ).strip()
+            customer_gst_pan = left_gst
+        if len(parts) >= 2:
+            customer_state = normalize_state(parts[-1])
+
+    # Fallback: GSTIN starting with 27 belongs to Maharashtra
+    if not customer_state and customer_gst_pan.startswith("27"):
+        customer_state = "Maharashtra"
+
+    # 4. HSN Code & Company Name (auto-read from Bank Details if available)
+    hsn_code = ""
+    detected_company_name = ""
+    for line in p1_lines:
+        if not hsn_code:
+            m_hsn = re.search(r"HSN\s*CODE\.?\s*[:\-]?\s*([0-9]+)", line, re.IGNORECASE)
+            if m_hsn:
+                hsn_code = m_hsn.group(1).strip()
+        if not detected_company_name:
+            m_comp = re.search(r"^Name\s*[:\-]\s*([A-Za-z0-9\s&\.\-]+?)(?:\s{3,}|$)", line.strip())
+            if m_comp:
+                detected_company_name = m_comp.group(1).strip()
+
+    company_name = detected_company_name or default_company_info["company_name"]
+
+    # 5. Extract Page 1 Table Rows (between Product Descriptions and HSN CODE / Gross Total)
+    tbl_start = None
+    tbl_end = None
+    for idx, line in enumerate(p1_lines):
+        if tbl_start is None and re.search(r"Product\s*Descriptions?", line, re.IGNORECASE):
+            tbl_start = idx + 1
+        elif tbl_start is not None and (
+            re.search(r"HSN\s*CODE", line, re.IGNORECASE)
+            or re.search(r"Gross\s*Total", line, re.IGNORECASE)
+            or re.search(r"Amount\s*Chag?eable", line, re.IGNORECASE)
+        ):
+            tbl_end = idx
+            break
+
+    summary_rates: Dict[str, float] = {}
+    p1_dispatch_rows: List[dict] = []
+    p1_summary_rows: List[dict] = []
+
+    if tbl_start is not None:
+        table_lines = p1_lines[tbl_start : (tbl_end if tbl_end else len(p1_lines))]
+        for line in table_lines:
+            s = line.strip()
+            if not s:
+                continue
+
+            # Layout B1: Date + Vehicle + Metal + TON + Rate + Amount
+            m_full = re.match(
+                rf"^(?:\d+\s{{2,}})?({DATE_PAT})\s+({VEH_PAT})\s+(.+?)\s+({NUM_PAT})\s+({NUM_PAT})\s+({NUM_PAT})$",
+                s,
+                re.IGNORECASE,
+            )
+            if m_full:
+                d_date, veh, metal, ton, rate, _ = m_full.groups()
+                metal_norm = normalize_metal(metal)
+                summary_rates[metal_norm] = to_float(rate)
+                p1_dispatch_rows.append(
+                    {
+                        "sr_no": str(len(p1_dispatch_rows) + 1),
+                        "dispatch_date": parse_date_ddmmyyyy(d_date),
+                        "challan_no": "",
+                        "vehicle_no": re.sub(r"\s+", " ", veh.strip().upper()),
+                        "metal_type": metal_norm,
+                        "ton": to_float(ton),
+                        "rate": to_float(rate),
+                    }
+                )
+                continue
+
+            # Layout B2: Vehicle + Date + Metal + TON + Rate + Amount (if reversed)
+            m_full_rev = re.match(
+                rf"^(?:\d+\s{{2,}})?({VEH_PAT})\s+({DATE_PAT})\s+(.+?)\s+({NUM_PAT})\s+({NUM_PAT})\s+({NUM_PAT})$",
+                s,
+                re.IGNORECASE,
+            )
+            if m_full_rev:
+                veh, d_date, metal, ton, rate, _ = m_full_rev.groups()
+                metal_norm = normalize_metal(metal)
+                summary_rates[metal_norm] = to_float(rate)
+                p1_dispatch_rows.append(
+                    {
+                        "sr_no": str(len(p1_dispatch_rows) + 1),
+                        "dispatch_date": parse_date_ddmmyyyy(d_date),
+                        "challan_no": "",
+                        "vehicle_no": re.sub(r"\s+", " ", veh.strip().upper()),
+                        "metal_type": metal_norm,
+                        "ton": to_float(ton),
+                        "rate": to_float(rate),
+                    }
+                )
+                continue
+
+            # Layout A: Summary line -> Metal + TON + Rate + Amount
+            m_sum = re.match(
+                rf"^(.+?)\s+({NUM_PAT})\s+({NUM_PAT})\s+({NUM_PAT})$",
+                s,
+                re.IGNORECASE,
+            )
+            if m_sum:
+                metal, ton, rate, _ = m_sum.groups()
+                metal = re.sub(r"^\d+\s{2,}", "", metal).strip()
+                metal_norm = normalize_metal(metal)
+                summary_rates[metal_norm] = to_float(rate)
+                p1_summary_rows.append(
+                    {
+                        "sr_no": str(len(p1_summary_rows) + 1),
+                        "dispatch_date": invoice_date,
+                        "challan_no": "",
+                        "vehicle_no": "",
+                        "metal_type": metal_norm,
+                        "ton": to_float(ton),
+                        "rate": to_float(rate),
+                    }
+                )
+
+    # 6. Extract Page 2+ Challan / Dispatch Table (if present)
+    p2_dispatch_rows: List[dict] = []
+    for page in reader.pages[1:]:
+        p_text = page.extract_text(extraction_mode="layout") or ""
+        for line in p_text.splitlines():
+            s = line.strip()
+            if not s or re.search(r"Sr\.?\s*No|VEHIC", s, re.IGNORECASE):
+                continue
+
+            # Pattern: Sr.No. Date [ChallanNo] VehicleNo Metal TON
+            m_p2 = re.match(
+                rf"^(\d+)\s+({DATE_PAT})\s+(?:(\S+)\s+)?({VEH_PAT})\s+(.+?)\s+({NUM_PAT})$",
+                s,
+                re.IGNORECASE,
+            )
+            if m_p2:
+                sr, d_date, challan, veh, metal, ton = m_p2.groups()
+                metal_norm = normalize_metal(metal)
+                p2_dispatch_rows.append(
+                    {
+                        "sr_no": sr.strip(),
+                        "dispatch_date": parse_date_ddmmyyyy(d_date),
+                        "challan_no": (challan or "").strip(),
+                        "vehicle_no": re.sub(r"\s+", " ", veh.strip().upper()),
+                        "metal_type": metal_norm,
+                        "ton": to_float(ton),
+                        "rate": summary_rates.get(metal_norm, 0.0),
+                    }
+                )
+
+    # Choose best source of line items: Page 2 Challan > Page 1 Dispatch > Page 1 Summary
+    raw_items = p2_dispatch_rows or p1_dispatch_rows or p1_summary_rows
+
+    # 7. Calculate GST & Build Final Rows
+    is_maharashtra = customer_state.lower() == "maharashtra"
+    fy = get_financial_year(invoice_date)
+    bill_num_int = extract_bill_number_int(bill_no)
+    bill_no_clean = str(bill_no).strip()
 
     dispatch_rows = []
     total_ton = 0.0
     gross_amount = 0.0
 
-    if inv.dispatch_items:
-        for idx, d in enumerate(inv.dispatch_items, start=1):
-            metal = normalize_metal(d.metal_type)
-            ton = float(d.ton or 0.0)
-            rate = float(d.rate) if d.rate is not None else rate_map.get(metal, 0.0)
-            line_amount = round(ton * rate, 2)
+    for item in raw_items:
+        ton = float(item["ton"])
+        rate = float(item["rate"])
+        line_amount = round(ton * rate, 2)
 
-            if is_maharashtra:
-                cgst = round(line_amount * 0.025, 2)
-                sgst = round(line_amount * 0.025, 2)
-                igst = 0.0
-            else:
-                cgst = 0.0
-                sgst = 0.0
-                igst = round(line_amount * 0.05, 2)
+        if is_maharashtra:
+            cgst = round(line_amount * 0.025, 2)
+            sgst = round(line_amount * 0.025, 2)
+            igst = 0.0
+        else:
+            cgst = 0.0
+            sgst = 0.0
+            igst = round(line_amount * 0.05, 2)
 
-            line_total = round(line_amount + cgst + sgst + igst, 2)
-            total_ton += ton
-            gross_amount += line_amount
+        line_total = round(line_amount + cgst + sgst + igst, 2)
+        total_ton += ton
+        gross_amount += line_amount
 
-            dispatch_rows.append(
-                {
-                    "Financial Year": fy,
-                    "Bill No": bill_no_clean,
-                    "Bill No (Num)": bill_num_int,
-                    "Invoice Date": inv.invoice_date,
-                    "Bill To Name": inv.bill_to_name,
-                    "Customer State": state,
-                    "Sr. No.": d.sr_no if d.sr_no else str(idx),
-                    "Dispatch Date": d.dispatch_date,
-                    "Challan No": d.challan_no,
-                    "Vehicle No": d.vehicle_no,
-                    "Metal Type": metal,
-                    "TON": round(ton, 2),
-                    "Rate": round(rate, 2),
-                    "Amount (TON x Rate)": line_amount,
-                    "CGST (2.5%)": cgst,
-                    "SGST (2.5%)": sgst,
-                    "IGST (5%)": igst,
-                    "Line Total": line_total,
-                    "Source File": source_filename,
-                }
-            )
-    else:
-        for idx, s in enumerate(inv.summary_rates, start=1):
-            metal = normalize_metal(s.metal_type)
-            ton = float(s.total_ton or 0.0)
-            rate = float(s.rate or 0.0)
-            line_amount = round(ton * rate, 2)
-
-            if is_maharashtra:
-                cgst = round(line_amount * 0.025, 2)
-                sgst = round(line_amount * 0.025, 2)
-                igst = 0.0
-            else:
-                cgst = 0.0
-                sgst = 0.0
-                igst = round(line_amount * 0.05, 2)
-
-            line_total = round(line_amount + cgst + sgst + igst, 2)
-            total_ton += ton
-            gross_amount += line_amount
-
-            dispatch_rows.append(
-                {
-                    "Financial Year": fy,
-                    "Bill No": bill_no_clean,
-                    "Bill No (Num)": bill_num_int,
-                    "Invoice Date": inv.invoice_date,
-                    "Bill To Name": inv.bill_to_name,
-                    "Customer State": state,
-                    "Sr. No.": str(idx),
-                    "Dispatch Date": inv.invoice_date,
-                    "Challan No": "",
-                    "Vehicle No": "",
-                    "Metal Type": metal,
-                    "TON": round(ton, 2),
-                    "Rate": round(rate, 2),
-                    "Amount (TON x Rate)": line_amount,
-                    "CGST (2.5%)": cgst,
-                    "SGST (2.5%)": sgst,
-                    "IGST (5%)": igst,
-                    "Line Total": line_total,
-                    "Source File": source_filename,
-                }
-            )
+        dispatch_rows.append(
+            {
+                "Financial Year": fy,
+                "Bill No": bill_no_clean,
+                "Bill No (Num)": bill_num_int,
+                "Invoice Date": invoice_date,
+                "Bill To Name": bill_to_name,
+                "Customer State": customer_state,
+                "Sr. No.": item["sr_no"],
+                "Dispatch Date": item["dispatch_date"],
+                "Challan No": item["challan_no"],
+                "Vehicle No": item["vehicle_no"],
+                "Metal Type": item["metal_type"],
+                "TON": round(ton, 2),
+                "Rate": round(rate, 2),
+                "Amount (TON x Rate)": line_amount,
+                "CGST (2.5%)": cgst,
+                "SGST (2.5%)": sgst,
+                "IGST (5%)": igst,
+                "Line Total": line_total,
+                "Source File": source_filename,
+            }
+        )
 
     gross_amount = round(gross_amount, 2)
     if is_maharashtra:
@@ -265,17 +402,17 @@ def process_extracted_invoice(inv: InvoiceData, source_filename: str):
         "Financial Year": fy,
         "Bill No": bill_no_clean,
         "Bill No (Num)": bill_num_int,
-        "Invoice Date": inv.invoice_date,
-        "Company Name": inv.company_name,
-        "Company GSTIN": inv.company_gstin,
-        "Company PAN": inv.company_pan,
-        "Company Details": inv.company_details,
-        "Bill To Name": inv.bill_to_name,
-        "Bill To Address": inv.bill_to_address,
-        "Shipping Address": inv.shipping_address,
-        "Customer GST/PAN": inv.customer_gst_pan,
-        "Customer State": state,
-        "HSN Code": inv.hsn_code,
+        "Invoice Date": invoice_date,
+        "Company Name": company_name,
+        "Company GSTIN": default_company_info["company_gstin"],
+        "Company PAN": default_company_info["company_pan"],
+        "Company Details": default_company_info["company_details"],
+        "Bill To Name": bill_to_name,
+        "Bill To Address": bill_to_address,
+        "Shipping Address": shipping_address,
+        "Customer GST/PAN": customer_gst_pan,
+        "Customer State": customer_state,
+        "HSN Code": hsn_code,
         "Total TON": round(total_ton, 2),
         "Gross Amount": gross_amount,
         "CGST (2.5%)": inv_cgst,
@@ -290,7 +427,6 @@ def process_extracted_invoice(inv: InvoiceData, source_filename: str):
 
 
 def extract_pdfs_from_uploads(uploaded_files):
-    """Returns list of (filename, pdf_bytes) from uploaded PDFs and ZIP files."""
     pdf_list = []
     for f in uploaded_files:
         name = f.name
@@ -375,32 +511,26 @@ if "dispatch_df" not in st.session_state:
     st.session_state.dispatch_df = pd.DataFrame()
 
 # ==========================================
-# SIDEBAR: API KEY, MODEL & MASTER EXCEL
+# SIDEBAR: COMPANY HEADER & MASTER EXCEL
 # ==========================================
 with st.sidebar:
-    st.header("⚙️ Settings")
-
-    default_api_key = st.secrets.get("GEMINI_API_KEY", "") if hasattr(st, "secrets") else ""
-    api_key = st.text_input(
-        "Gemini API Key",
-        value=default_api_key,
-        type="password",
-        help="Streamlit Cloud Secrets me GEMINI_API_KEY save kar sakte hain.",
+    st.header("🏢 Company Header Details")
+    st.caption("PDF ka top letterhead image hai, isliye ye details yahan se automatically fill hongi (zaroorat par edit kar sakte hain):")
+    comp_name = st.text_input("Company Name", value="SAIKRUPA ENTERPRISES")
+    comp_gstin = st.text_input("Company GSTIN", value="27AZRPP3943M1ZH")
+    comp_pan = st.text_input("Company PAN", value="AZRPP3943M")
+    comp_details = st.text_area(
+        "Company Address & Contact",
+        value="Water & Building Material Suppliers, At. Khandwal, Post. Amane, Tal. Bhiwandi, Dist. Thane. | Dinesh Patil: 9049855858 / 9881210811",
+        height=90,
     )
 
-    model_name = st.text_input(
-        "Gemini Model",
-        value="gemini-3.8-flash",
-        help="Default latest model: gemini-3.8-flash",
-    )
-
-    parallel_workers = st.slider(
-        "Processing Speed (Parallel PDFs)",
-        min_value=1,
-        max_value=8,
-        value=5,
-        help="Ek saath kitni PDFs process honi chahiye (5 recommended hai).",
-    )
+    default_company_info = {
+        "company_name": comp_name.strip(),
+        "company_gstin": comp_gstin.strip(),
+        "company_pan": comp_pan.strip(),
+        "company_details": comp_details.strip(),
+    }
 
     st.divider()
     st.subheader("1️⃣ Purana Master Excel Load Karein (Optional)")
@@ -439,105 +569,89 @@ with st.sidebar:
 # ==========================================
 st.subheader("2️⃣ Naye Invoice PDFs ya ZIP File Upload Karein")
 uploaded_files = st.file_uploader(
-    "PDFs select karein ya saari PDFs ki 1 ZIP file upload karein (Fastest)",
+    "Saari PDFs select karein ya unki 1 ZIP file upload karein (Fastest)",
     type=["pdf", "zip"],
     accept_multiple_files=True,
 )
 
 if uploaded_files:
-    if st.button("🚀 Extract & Update Excel Data", type="primary"):
-        if not api_key:
-            st.error("Kripya Sidebar me apna Gemini API Key daalein (ya Streamlit Secrets me set karein).")
+    if st.button("⚡ Extract & Update Excel Data", type="primary"):
+        pdf_items = extract_pdfs_from_uploads(uploaded_files)
+        total_pdfs = len(pdf_items)
+
+        if total_pdfs == 0:
+            st.warning("Koi valid PDF file nahi mili.")
         else:
-            pdf_items = extract_pdfs_from_uploads(uploaded_files)
-            total_pdfs = len(pdf_items)
+            existing_bills = set()
+            if not st.session_state.summary_df.empty and "Bill No" in st.session_state.summary_df.columns:
+                existing_bills = set(st.session_state.summary_df["Bill No"].astype(str).str.strip())
 
-            if total_pdfs == 0:
-                st.warning("Koi valid PDF file nahi mili.")
-            else:
-                existing_bills = set()
-                if not st.session_state.summary_df.empty and "Bill No" in st.session_state.summary_df.columns:
-                    existing_bills = set(st.session_state.summary_df["Bill No"].astype(str).str.strip())
+            new_summaries = []
+            new_dispatches = []
+            skipped_files = []
+            error_files = []
 
-                new_summaries = []
-                new_dispatches = []
-                skipped_files = []
-                error_files = []
+            progress_bar = st.progress(0)
+            status_text = st.empty()
 
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                status_text.text(f"0/{total_pdfs} PDFs processed ({parallel_workers} parallel workers active)...")
+            for i, (fname, fbytes) in enumerate(pdf_items, start=1):
+                try:
+                    summary_row, dispatch_rows = parse_pdf_invoice(fbytes, fname, default_company_info)
+                    bill_no_str = str(summary_row["Bill No"]).strip()
 
-                completed_count = 0
+                    if bill_no_str in existing_bills and not overwrite_duplicates:
+                        skipped_files.append(f"{fname} (Bill No: {bill_no_str})")
+                    else:
+                        if bill_no_str in existing_bills and overwrite_duplicates:
+                            st.session_state.summary_df = st.session_state.summary_df[
+                                st.session_state.summary_df["Bill No"].astype(str).str.strip() != bill_no_str
+                            ]
+                            st.session_state.dispatch_df = st.session_state.dispatch_df[
+                                st.session_state.dispatch_df["Bill No"].astype(str).str.strip() != bill_no_str
+                            ]
 
-                def worker(item):
-                    fname, fbytes = item
-                    inv = parse_invoice_with_gemini(fbytes, api_key, model_name.strip())
-                    return fname, inv
+                        new_summaries.append(summary_row)
+                        new_dispatches.extend(dispatch_rows)
+                        existing_bills.add(bill_no_str)
 
-                with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
-                    future_to_name = {executor.submit(worker, item): item[0] for item in pdf_items}
-                    for future in as_completed(future_to_name):
-                        fname = future_to_name[future]
-                        completed_count += 1
-                        try:
-                            _, inv_data = future.result()
-                            bill_no_str = str(inv_data.bill_no).strip()
+                except Exception as e:
+                    error_files.append(f"{fname}: {e}")
 
-                            if bill_no_str in existing_bills and not overwrite_duplicates:
-                                skipped_files.append(f"{fname} (Bill No: {bill_no_str})")
-                            else:
-                                if bill_no_str in existing_bills and overwrite_duplicates:
-                                    st.session_state.summary_df = st.session_state.summary_df[
-                                        st.session_state.summary_df["Bill No"].astype(str).str.strip() != bill_no_str
-                                    ]
-                                    st.session_state.dispatch_df = st.session_state.dispatch_df[
-                                        st.session_state.dispatch_df["Bill No"].astype(str).str.strip() != bill_no_str
-                                    ]
+                progress_bar.progress(i / total_pdfs)
+                status_text.text(f"Processed {i}/{total_pdfs}: {fname}")
 
-                                summary_row, dispatch_rows = process_extracted_invoice(inv_data, fname)
-                                new_summaries.append(summary_row)
-                                new_dispatches.extend(dispatch_rows)
-                                existing_bills.add(bill_no_str)
+            status_text.empty()
+            progress_bar.empty()
 
-                        except Exception as e:
-                            error_files.append(f"{fname}: {e}")
+            if new_summaries:
+                new_sum_df = pd.DataFrame(new_summaries)
+                new_disp_df = pd.DataFrame(new_dispatches)
 
-                        progress_bar.progress(completed_count / total_pdfs)
-                        status_text.text(f"Processed {completed_count}/{total_pdfs}: {fname}")
+                st.session_state.summary_df = pd.concat(
+                    [st.session_state.summary_df, new_sum_df], ignore_index=True
+                )
+                st.session_state.dispatch_df = pd.concat(
+                    [st.session_state.dispatch_df, new_disp_df], ignore_index=True
+                )
 
-                status_text.empty()
-                progress_bar.empty()
+                if "Bill No (Num)" in st.session_state.summary_df.columns:
+                    st.session_state.summary_df = st.session_state.summary_df.sort_values(
+                        by="Bill No (Num)", ascending=True
+                    ).reset_index(drop=True)
+                if "Bill No (Num)" in st.session_state.dispatch_df.columns:
+                    st.session_state.dispatch_df = st.session_state.dispatch_df.sort_values(
+                        by=["Bill No (Num)"], ascending=True
+                    ).reset_index(drop=True)
 
-                if new_summaries:
-                    new_sum_df = pd.DataFrame(new_summaries)
-                    new_disp_df = pd.DataFrame(new_dispatches)
+                st.success(f"✅ {len(new_summaries)} naye invoice turant extract aur add ho gaye!")
 
-                    st.session_state.summary_df = pd.concat(
-                        [st.session_state.summary_df, new_sum_df], ignore_index=True
-                    )
-                    st.session_state.dispatch_df = pd.concat(
-                        [st.session_state.dispatch_df, new_disp_df], ignore_index=True
-                    )
+            if skipped_files:
+                st.info("⏭️ Ye duplicate invoices skip kiye gaye: " + ", ".join(skipped_files))
 
-                    if "Bill No (Num)" in st.session_state.summary_df.columns:
-                        st.session_state.summary_df = st.session_state.summary_df.sort_values(
-                            by="Bill No (Num)", ascending=True
-                        ).reset_index(drop=True)
-                    if "Bill No (Num)" in st.session_state.dispatch_df.columns:
-                        st.session_state.dispatch_df = st.session_state.dispatch_df.sort_values(
-                            by=["Bill No (Num)"], ascending=True
-                        ).reset_index(drop=True)
-
-                    st.success(f"✅ {len(new_summaries)} naye invoice successfully extract aur add ho gaye!")
-
-                if skipped_files:
-                    st.info("⏭️ Ye duplicate invoices skip kiye gaye: " + ", ".join(skipped_files))
-
-                if error_files:
-                    with st.expander(f"❌ {len(error_files)} files me error aaya (click karke dekhein)"):
-                        for err in error_files:
-                            st.write(err)
+            if error_files:
+                with st.expander(f"⚠️ {len(error_files)} files me issue aaya (click karke dekhein)"):
+                    for err in error_files:
+                        st.write(err)
 
 # ==========================================
 # DASHBOARD, MISSING INVOICE ALERT & EXPORT
