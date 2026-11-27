@@ -1,6 +1,7 @@
 import io
 import re
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -12,17 +13,33 @@ from pypdf import PdfReader
 import streamlit as st
 
 # ==========================================
-# PAGE CONFIGURATION
+# PAGE CONFIGURATION & SPEED CSS
 # ==========================================
 st.set_page_config(
-    page_title="Invoice PDF to Excel Extractor (Fast)",
+    page_title="Invoice PDF to Excel Extractor (Turbo)",
     page_icon="⚡",
     layout="wide",
 )
 
+# Keeps file uploader fast even when 100+ PDFs are selected
+st.markdown(
+    """
+    <style>
+    [data-testid="stFileUploader"] ul {
+        max-height: 120px;
+        overflow-y: auto;
+        border: 1px solid #e0e0e0;
+        border-radius: 6px;
+        padding: 4px;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.title("⚡ Building Material Invoice PDF to Excel Extractor")
 st.caption(
-    "Zero API Key • Single Master Sheet (Invoice Summary + Challan Dispatch Details) • Missing Invoice Alert"
+    "Turbo Upload • Zero API Key • Single Master Sheet (Invoice Summary + Challan Details) • Missing Invoice Alert"
 )
 
 # ==========================================
@@ -243,9 +260,7 @@ def parse_pdf_invoice(
         table_lines = p1_lines[tbl_start : (tbl_end if tbl_end else len(p1_lines))]
         for line in table_lines:
             s = line.strip()
-            if not s:
-                continue
-            if re.search(r"VEHIC|CH\.?\s*NO|METAL\s+TON", s, re.IGNORECASE):
+            if not s or re.search(r"VEHIC|CH\.?\s*NO|METAL\s+TON", s, re.IGNORECASE):
                 continue
 
             # Layout B1: Date + Vehicle + [Optional CH.NO] + Metal + TON + Rate + Amount
@@ -348,7 +363,7 @@ def parse_pdf_invoice(
 
     raw_items = p2_dispatch_rows or p1_dispatch_rows or p1_summary_rows
 
-    # 7. Calculate Invoice Totals & Build Single-Sheet Combined Rows
+    # 7. Calculate Totals & Build Combined Rows
     is_maharashtra = customer_state.lower() == "maharashtra"
     fy = get_financial_year(invoice_date)
     bill_num_int = extract_bill_number_int(bill_no)
@@ -370,7 +385,6 @@ def parse_pdf_invoice(
 
     combined_rows = []
     if not raw_items:
-        # Even if no line items matched, keep 1 header row so the bill is visible
         combined_rows.append(
             {
                 "Financial Year": fy,
@@ -450,7 +464,6 @@ def parse_pdf_invoice(
                 "SGST (2.5%)": sgst,
                 "IGST (5%)": igst,
                 "Line Total": line_total,
-                # Shown only on 1st row of each bill so Excel SUM() stays exact
                 "Invoice Round Off": inv_round_off if idx == 0 else None,
                 "Invoice Grand Total": inv_grand_total if idx == 0 else None,
                 "Source File": source_filename,
@@ -464,14 +477,16 @@ def extract_pdfs_from_uploads(uploaded_files):
     pdf_list = []
     for f in uploaded_files:
         name = f.name
+        raw_bytes = f.getvalue()
         if name.lower().endswith(".zip"):
-            with zipfile.ZipFile(io.BytesIO(f.read())) as zf:
+            with zipfile.ZipFile(io.BytesIO(raw_bytes)) as zf:
                 for zname in zf.namelist():
                     if zname.lower().endswith(".pdf") and not zname.startswith("__MACOSX"):
                         clean_name = zname.split("/")[-1]
-                        pdf_list.append((clean_name, zf.read(zname)))
+                        if clean_name:
+                            pdf_list.append((clean_name, zf.read(zname)))
         elif name.lower().endswith(".pdf"):
-            pdf_list.append((name, f.read()))
+            pdf_list.append((name, raw_bytes))
     return pdf_list
 
 
@@ -498,10 +513,8 @@ def find_missing_invoices(master_df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def generate_excel_bytes(
-    master_df: pd.DataFrame,
-    missing_df: pd.DataFrame,
-) -> bytes:
+@st.cache_data(show_spinner=False)
+def generate_excel_bytes(master_df: pd.DataFrame, missing_df: pd.DataFrame) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         master_df.to_excel(writer, sheet_name="Master_Invoice_Data", index=False)
@@ -546,7 +559,6 @@ if "master_df" not in st.session_state:
 # ==========================================
 with st.sidebar:
     st.header("🏢 Company Header Details")
-    st.caption("PDF ka top letterhead image hai, isliye ye details yahan se automatically fill hongi:")
     comp_name = st.text_input("Company Name", value="SAIKRUPA ENTERPRISES")
     comp_gstin = st.text_input("Company GSTIN", value="27AZRPP3943M1ZH")
     comp_pan = st.text_input("Company PAN", value="AZRPP3943M")
@@ -564,114 +576,131 @@ with st.sidebar:
     }
 
     st.divider()
-    st.subheader("1️⃣ Purana Master Excel Load Karein (Optional)")
-    master_excel = st.file_uploader(
-        "Upload Existing Master Excel (.xlsx)",
-        type=["xlsx"],
-        key="master_excel_uploader",
-    )
+    st.subheader("1️⃣ Purana Master Excel Load Karein")
+    with st.form("load_excel_form", clear_on_submit=True):
+        master_excel = st.file_uploader(
+            "Upload Existing Master Excel (.xlsx)",
+            type=["xlsx"],
+        )
+        load_clicked = st.form_submit_button("📥 Load Master Excel", use_container_width=True)
 
-    if master_excel is not None:
-        if st.button("📥 Load Master Excel Data", use_container_width=True):
-            try:
-                xls = pd.ExcelFile(master_excel)
-                if "Master_Invoice_Data" in xls.sheet_names:
-                    st.session_state.master_df = pd.read_excel(xls, sheet_name="Master_Invoice_Data")
-                    bill_cnt = st.session_state.master_df["Bill No"].nunique()
-                    st.success(f"✅ {bill_cnt} purane invoices ({len(st.session_state.master_df)} rows) load ho gaye!")
-                else:
-                    st.error("Invalid Master Excel format. 'Master_Invoice_Data' sheet nahi mili.")
-            except Exception as e:
-                st.error(f"Excel load karne me error aaya: {e}")
+    if load_clicked and master_excel is not None:
+        try:
+            xls = pd.ExcelFile(master_excel)
+            if "Master_Invoice_Data" in xls.sheet_names:
+                st.session_state.master_df = pd.read_excel(xls, sheet_name="Master_Invoice_Data")
+                bill_cnt = st.session_state.master_df["Bill No"].nunique()
+                st.success(f"✅ {bill_cnt} purane invoices load ho gaye!")
+            else:
+                st.error("'Master_Invoice_Data' sheet nahi mili.")
+        except Exception as e:
+            st.error(f"Error: {e}")
 
     st.divider()
-    overwrite_duplicates = st.checkbox(
-        "Duplicate Bill No. aane par overwrite karein",
-        value=False,
-    )
+    overwrite_duplicates = st.checkbox("Duplicate Bill No. overwrite karein", value=False)
 
     if st.button("🗑️ Clear Current Session Data", use_container_width=True):
         st.session_state.master_df = pd.DataFrame()
         st.rerun()
 
 # ==========================================
-# MAIN AREA: UPLOAD PDFs OR ZIP
+# MAIN AREA: TURBO FORM UPLOAD (ZIP OR PDFs)
 # ==========================================
-st.subheader("2️⃣ Naye Invoice PDFs ya ZIP File Upload Karein")
-uploaded_files = st.file_uploader(
-    "Saari PDFs select karein ya unki 1 ZIP file upload karein (Fastest)",
-    type=["pdf", "zip"],
-    accept_multiple_files=True,
-)
+st.subheader("2️⃣ Fast Invoice Upload")
+st.info("🚀 **Fastest Tip (100+ files ke liye):** Saari PDFs select karke **Right-Click → Compress to ZIP** karein aur sirf 1 `.zip` file upload karein — 2 second me upload hogi!")
 
-if uploaded_files:
-    if st.button("⚡ Extract & Update Excel Data", type="primary"):
+with st.form("invoice_upload_form", clear_on_submit=True):
+    uploaded_files = st.file_uploader(
+        "1 ZIP file (Fastest) ya Multiple PDFs select karein",
+        type=["zip", "pdf"],
+        accept_multiple_files=True,
+    )
+    extract_clicked = st.form_submit_button(
+        "⚡ Extract & Update Excel Data",
+        type="primary",
+        use_container_width=True,
+    )
+
+if extract_clicked and uploaded_files:
+    with st.spinner("Files unpack ho rahi hain..."):
         pdf_items = extract_pdfs_from_uploads(uploaded_files)
-        total_pdfs = len(pdf_items)
 
-        if total_pdfs == 0:
-            st.warning("Koi valid PDF file nahi mili.")
-        else:
-            existing_bills = set()
-            if not st.session_state.master_df.empty and "Bill No" in st.session_state.master_df.columns:
-                existing_bills = set(st.session_state.master_df["Bill No"].astype(str).str.strip())
+    total_pdfs = len(pdf_items)
+    if total_pdfs == 0:
+        st.warning("Koi valid PDF file nahi mili.")
+    else:
+        existing_bills = set()
+        if not st.session_state.master_df.empty and "Bill No" in st.session_state.master_df.columns:
+            existing_bills = set(st.session_state.master_df["Bill No"].astype(str).str.strip())
 
-            new_rows = []
-            added_bills_count = 0
-            skipped_files = []
-            error_files = []
+        new_rows = []
+        added_bills_count = 0
+        skipped_files = []
+        error_files = []
 
-            progress_bar = st.progress(0)
-            status_text = st.empty()
+        progress_bar = st.progress(0)
+        status_text = st.empty()
 
-            for i, (fname, fbytes) in enumerate(pdf_items, start=1):
+        # Parallel extraction using ThreadPoolExecutor
+        parsed_results = []
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = {
+                executor.submit(parse_pdf_invoice, fbytes, fname, default_company_info): fname
+                for fname, fbytes in pdf_items
+            }
+            for done_idx, future in enumerate(as_completed(futures), start=1):
+                fname = futures[future]
                 try:
-                    invoice_rows = parse_pdf_invoice(fbytes, fname, default_company_info)
-                    bill_no_str = str(invoice_rows[0]["Bill No"]).strip()
-
-                    if bill_no_str in existing_bills and not overwrite_duplicates:
-                        skipped_files.append(f"{fname} (Bill No: {bill_no_str})")
-                    else:
-                        if bill_no_str in existing_bills and overwrite_duplicates:
-                            st.session_state.master_df = st.session_state.master_df[
-                                st.session_state.master_df["Bill No"].astype(str).str.strip() != bill_no_str
-                            ]
-
-                        new_rows.extend(invoice_rows)
-                        existing_bills.add(bill_no_str)
-                        added_bills_count += 1
-
+                    parsed_results.append((fname, future.result(), None))
                 except Exception as e:
-                    error_files.append(f"{fname}: {e}")
+                    parsed_results.append((fname, None, str(e)))
+                progress_bar.progress(done_idx / total_pdfs)
+                status_text.text(f"Extracted {done_idx}/{total_pdfs} files...")
 
-                progress_bar.progress(i / total_pdfs)
-                status_text.text(f"Processed {i}/{total_pdfs}: {fname}")
+        status_text.empty()
+        progress_bar.empty()
 
-            status_text.empty()
-            progress_bar.empty()
+        # Sort by filename for consistent duplicate handling
+        parsed_results.sort(key=lambda x: x[0])
 
-            if new_rows:
-                new_df = pd.DataFrame(new_rows)
-                st.session_state.master_df = pd.concat(
-                    [st.session_state.master_df, new_df], ignore_index=True
-                )
+        for fname, invoice_rows, err in parsed_results:
+            if err:
+                error_files.append(f"{fname}: {err}")
+                continue
 
-                if "Bill No (Num)" in st.session_state.master_df.columns:
-                    st.session_state.master_df = st.session_state.master_df.sort_values(
-                        by="Bill No (Num)", ascending=True, kind="mergesort"
-                    ).reset_index(drop=True)
+            bill_no_str = str(invoice_rows[0]["Bill No"]).strip()
+            if bill_no_str in existing_bills and not overwrite_duplicates:
+                skipped_files.append(f"{fname} (Bill No: {bill_no_str})")
+            else:
+                if bill_no_str in existing_bills and overwrite_duplicates:
+                    st.session_state.master_df = st.session_state.master_df[
+                        st.session_state.master_df["Bill No"].astype(str).str.strip() != bill_no_str
+                    ]
+                new_rows.extend(invoice_rows)
+                existing_bills.add(bill_no_str)
+                added_bills_count += 1
 
-                st.success(
-                    f"✅ {added_bills_count} naye invoice ({len(new_rows)} rows) turant extract aur add ho gaye!"
-                )
+        if new_rows:
+            new_df = pd.DataFrame(new_rows)
+            st.session_state.master_df = pd.concat(
+                [st.session_state.master_df, new_df], ignore_index=True
+            )
+            if "Bill No (Num)" in st.session_state.master_df.columns:
+                st.session_state.master_df = st.session_state.master_df.sort_values(
+                    by="Bill No (Num)", ascending=True, kind="mergesort"
+                ).reset_index(drop=True)
 
-            if skipped_files:
-                st.info("⏭️ Ye duplicate invoices skip kiye gaye: " + ", ".join(skipped_files))
+            st.success(
+                f"✅ {added_bills_count} naye invoice ({len(new_rows)} rows) turbo speed se add ho gaye!"
+            )
 
-            if error_files:
-                with st.expander(f"⚠️ {len(error_files)} files me issue aaya (click karke dekhein)"):
-                    for err in error_files:
-                        st.write(err)
+        if skipped_files:
+            st.info("⏭️ Duplicate invoices skip kiye gaye: " + ", ".join(skipped_files))
+
+        if error_files:
+            with st.expander(f"⚠️ {len(error_files)} files me issue aaya (click karke dekhein)"):
+                for err in error_files:
+                    st.write(err)
 
 # ==========================================
 # DASHBOARD, MISSING INVOICE ALERT & EXPORT
@@ -708,10 +737,7 @@ if not st.session_state.master_df.empty:
         else:
             st.dataframe(missing_df, use_container_width=True, hide_index=True)
 
-    excel_bytes = generate_excel_bytes(
-        st.session_state.master_df,
-        missing_df,
-    )
+    excel_bytes = generate_excel_bytes(st.session_state.master_df, missing_df)
     st.download_button(
         label="⬇️ Download Updated Master Excel (.xlsx)",
         data=excel_bytes,
