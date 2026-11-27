@@ -2,7 +2,7 @@ import io
 import re
 import zipfile
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import openpyxl
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -22,7 +22,7 @@ st.set_page_config(
 
 st.title("⚡ Building Material Invoice PDF to Excel Extractor")
 st.caption(
-    "Zero API Key • Zero Rate Limit • 100+ PDFs seconds me extract karein, purane Master Excel me append karein, aur missing invoices ka alert payein."
+    "Zero API Key • Single Master Sheet (Invoice Summary + Challan Dispatch Details) • Missing Invoice Alert"
 )
 
 # ==========================================
@@ -30,7 +30,6 @@ st.caption(
 # ==========================================
 DATE_PAT = r"(?:\d{1,2}[-/\.](?:[A-Za-z]{3,9}|\d{1,2})[-/\.]\d{2,4})"
 NUM_PAT = r"\d+(?:,\d+)*(?:\.\d+)?"
-# Supports both full (MH04 MH 0777) and short (KU 3900) vehicle numbers
 VEH_PAT = r"(?:[A-Z]{2}\s*-?\s*\d{1,2}\s*-?\s*[A-Z]{1,3}\s*-?\s*\d{1,4}|[A-Z]{2,3}\s*-?\s*\d{3,4})"
 
 
@@ -87,13 +86,13 @@ def get_financial_year(date_str: str) -> str:
 
 
 # ==========================================
-# DIRECT PYTHON PDF PARSER (NO API)
+# DIRECT PYTHON PDF PARSER (COMBINED ROWS)
 # ==========================================
 def parse_pdf_invoice(
     pdf_bytes: bytes,
     source_filename: str,
     default_company_info: Dict[str, str],
-) -> Tuple[dict, List[dict]]:
+) -> List[dict]:
     reader = PdfReader(io.BytesIO(pdf_bytes))
     if not reader.pages:
         raise ValueError("PDF me koi page nahi mila.")
@@ -124,7 +123,7 @@ def parse_pdf_invoice(
         if m_fn:
             bill_no = m_fn.group(1)
 
-    # 2. Bill To & Shipping Address (supports invoices with OR without "Bill To," label)
+    # 2. Bill To & Shipping Address
     bill_to_idx = None
     gst_idx = None
     ship_col = None
@@ -135,7 +134,6 @@ def parse_pdf_invoice(
             gst_idx = idx
             break
 
-    # If "Bill To," label is absent, start right after "Bill No." line
     if bill_to_idx is None and bill_no_idx is not None:
         bill_to_idx = bill_no_idx
 
@@ -175,12 +173,11 @@ def parse_pdf_invoice(
     bill_to_address = ", ".join(bill_to_lines[1:]) if len(bill_to_lines) > 1 else ""
     shipping_address = ", ".join(shipping_lines)
 
-    # 3. Customer GST/PAN & State (robust extraction)
+    # 3. Customer GST/PAN & State
     customer_gst_pan = ""
     customer_state = ""
     if gst_idx is not None:
         gst_line = p1_lines[gst_idx]
-        # Direct GSTIN (14-15 chars starting with 2 digits) or PAN (10 chars) match
         m_gstin = re.search(r"\b(\d{2}[A-Z]{5}\d{4}[A-Z][0-9A-Z]{1,3})\b", gst_line)
         m_pan = re.search(r"\b([A-Z]{5}\d{4}[A-Z])\b", gst_line)
 
@@ -248,11 +245,10 @@ def parse_pdf_invoice(
             s = line.strip()
             if not s:
                 continue
-            # Skip sub-header row like: DATE | VEHICAL NO. | CH.NO | METAL | TON | RATE | AMOUNT
             if re.search(r"VEHIC|CH\.?\s*NO|METAL\s+TON", s, re.IGNORECASE):
                 continue
 
-            # Layout B1: Date + Vehicle + [Optional CH.NO (not followed by MM)] + Metal + TON + Rate + Amount
+            # Layout B1: Date + Vehicle + [Optional CH.NO] + Metal + TON + Rate + Amount
             m_full = re.match(
                 rf"^(?:\d+\s{{2,}})?({DATE_PAT})\s+({VEH_PAT})\s+(?:(\d+[A-Za-z0-9/\-]*)(?!\s*MM\b)\s+)?(.+?)\s+({NUM_PAT})\s+({NUM_PAT})\s+({NUM_PAT})$",
                 s,
@@ -352,17 +348,65 @@ def parse_pdf_invoice(
 
     raw_items = p2_dispatch_rows or p1_dispatch_rows or p1_summary_rows
 
-    # 7. Calculate GST & Build Final Rows
+    # 7. Calculate Invoice Totals & Build Single-Sheet Combined Rows
     is_maharashtra = customer_state.lower() == "maharashtra"
     fy = get_financial_year(invoice_date)
     bill_num_int = extract_bill_number_int(bill_no)
     bill_no_clean = str(bill_no).strip()
 
-    dispatch_rows = []
-    total_ton = 0.0
-    gross_amount = 0.0
+    inv_gross = round(sum(round(float(x["ton"]) * float(x["rate"]), 2) for x in raw_items), 2)
+    if is_maharashtra:
+        inv_cgst = round(inv_gross * 0.025, 2)
+        inv_sgst = round(inv_gross * 0.025, 2)
+        inv_igst = 0.0
+    else:
+        inv_cgst = 0.0
+        inv_sgst = 0.0
+        inv_igst = round(inv_gross * 0.05, 2)
 
-    for item in raw_items:
+    raw_total = inv_gross + inv_cgst + inv_sgst + inv_igst
+    inv_grand_total = float(round(raw_total))
+    inv_round_off = round(inv_grand_total - raw_total, 2)
+
+    combined_rows = []
+    if not raw_items:
+        # Even if no line items matched, keep 1 header row so the bill is visible
+        combined_rows.append(
+            {
+                "Financial Year": fy,
+                "Bill No": bill_no_clean,
+                "Bill No (Num)": bill_num_int,
+                "Invoice Date": invoice_date,
+                "Company Name": company_name,
+                "Company GSTIN": default_company_info["company_gstin"],
+                "Company PAN": default_company_info["company_pan"],
+                "Company Details": default_company_info["company_details"],
+                "Bill To Name": bill_to_name,
+                "Bill To Address": bill_to_address,
+                "Shipping Address": shipping_address,
+                "Customer GST/PAN": customer_gst_pan,
+                "Customer State": customer_state,
+                "HSN Code": hsn_code,
+                "Sr. No.": "",
+                "Dispatch Date": "",
+                "Challan No": "",
+                "Vehicle No": "",
+                "Metal Type": "",
+                "TON": 0.0,
+                "Rate": 0.0,
+                "Amount (TON x Rate)": 0.0,
+                "CGST (2.5%)": 0.0,
+                "SGST (2.5%)": 0.0,
+                "IGST (5%)": 0.0,
+                "Line Total": 0.0,
+                "Invoice Round Off": 0.0,
+                "Invoice Grand Total": 0.0,
+                "Source File": source_filename,
+            }
+        )
+        return combined_rows
+
+    for idx, item in enumerate(raw_items):
         ton = float(item["ton"])
         rate = float(item["rate"])
         line_amount = round(ton * rate, 2)
@@ -377,17 +421,23 @@ def parse_pdf_invoice(
             igst = round(line_amount * 0.05, 2)
 
         line_total = round(line_amount + cgst + sgst + igst, 2)
-        total_ton += ton
-        gross_amount += line_amount
 
-        dispatch_rows.append(
+        combined_rows.append(
             {
                 "Financial Year": fy,
                 "Bill No": bill_no_clean,
                 "Bill No (Num)": bill_num_int,
                 "Invoice Date": invoice_date,
+                "Company Name": company_name,
+                "Company GSTIN": default_company_info["company_gstin"],
+                "Company PAN": default_company_info["company_pan"],
+                "Company Details": default_company_info["company_details"],
                 "Bill To Name": bill_to_name,
+                "Bill To Address": bill_to_address,
+                "Shipping Address": shipping_address,
+                "Customer GST/PAN": customer_gst_pan,
                 "Customer State": customer_state,
+                "HSN Code": hsn_code,
                 "Sr. No.": item["sr_no"],
                 "Dispatch Date": item["dispatch_date"],
                 "Challan No": item["challan_no"],
@@ -400,50 +450,14 @@ def parse_pdf_invoice(
                 "SGST (2.5%)": sgst,
                 "IGST (5%)": igst,
                 "Line Total": line_total,
+                # Shown only on 1st row of each bill so Excel SUM() stays exact
+                "Invoice Round Off": inv_round_off if idx == 0 else None,
+                "Invoice Grand Total": inv_grand_total if idx == 0 else None,
                 "Source File": source_filename,
             }
         )
 
-    gross_amount = round(gross_amount, 2)
-    if is_maharashtra:
-        inv_cgst = round(gross_amount * 0.025, 2)
-        inv_sgst = round(gross_amount * 0.025, 2)
-        inv_igst = 0.0
-    else:
-        inv_cgst = 0.0
-        inv_sgst = 0.0
-        inv_igst = round(gross_amount * 0.05, 2)
-
-    raw_total = gross_amount + inv_cgst + inv_sgst + inv_igst
-    grand_total = round(raw_total)
-    round_off = round(grand_total - raw_total, 2)
-
-    summary_row = {
-        "Financial Year": fy,
-        "Bill No": bill_no_clean,
-        "Bill No (Num)": bill_num_int,
-        "Invoice Date": invoice_date,
-        "Company Name": company_name,
-        "Company GSTIN": default_company_info["company_gstin"],
-        "Company PAN": default_company_info["company_pan"],
-        "Company Details": default_company_info["company_details"],
-        "Bill To Name": bill_to_name,
-        "Bill To Address": bill_to_address,
-        "Shipping Address": shipping_address,
-        "Customer GST/PAN": customer_gst_pan,
-        "Customer State": customer_state,
-        "HSN Code": hsn_code,
-        "Total TON": round(total_ton, 2),
-        "Gross Amount": gross_amount,
-        "CGST (2.5%)": inv_cgst,
-        "SGST (2.5%)": inv_sgst,
-        "IGST (5%)": inv_igst,
-        "Round Off": round_off,
-        "Grand Total": float(grand_total),
-        "Source File": source_filename,
-    }
-
-    return summary_row, dispatch_rows
+    return combined_rows
 
 
 def extract_pdfs_from_uploads(uploaded_files):
@@ -461,11 +475,11 @@ def extract_pdfs_from_uploads(uploaded_files):
     return pdf_list
 
 
-def find_missing_invoices(summary_df: pd.DataFrame) -> pd.DataFrame:
-    if summary_df.empty or "Bill No (Num)" not in summary_df.columns:
+def find_missing_invoices(master_df: pd.DataFrame) -> pd.DataFrame:
+    if master_df.empty or "Bill No (Num)" not in master_df.columns:
         return pd.DataFrame(columns=["Missing Bill No", "Status"])
 
-    valid_nums = summary_df["Bill No (Num)"].dropna().astype(int).unique().tolist()
+    valid_nums = master_df["Bill No (Num)"].dropna().astype(int).unique().tolist()
     if not valid_nums:
         return pd.DataFrame(columns=["Missing Bill No", "Status"])
 
@@ -485,14 +499,12 @@ def find_missing_invoices(summary_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def generate_excel_bytes(
-    summary_df: pd.DataFrame,
-    dispatch_df: pd.DataFrame,
+    master_df: pd.DataFrame,
     missing_df: pd.DataFrame,
 ) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        summary_df.to_excel(writer, sheet_name="Invoice_Summary", index=False)
-        dispatch_df.to_excel(writer, sheet_name="Challan_Dispatch_Details", index=False)
+        master_df.to_excel(writer, sheet_name="Master_Invoice_Data", index=False)
         missing_df.to_excel(writer, sheet_name="Missing_Invoices", index=False)
 
         wb = writer.book
@@ -503,6 +515,7 @@ def generate_excel_bytes(
         for sheet_name in wb.sheetnames:
             ws = wb[sheet_name]
             ws.freeze_panes = "A2"
+            ws.auto_filter.ref = ws.dimensions
 
             for cell in ws[1]:
                 cell.fill = header_fill
@@ -525,10 +538,8 @@ def generate_excel_bytes(
 # ==========================================
 # SESSION STATE INITIALIZATION
 # ==========================================
-if "summary_df" not in st.session_state:
-    st.session_state.summary_df = pd.DataFrame()
-if "dispatch_df" not in st.session_state:
-    st.session_state.dispatch_df = pd.DataFrame()
+if "master_df" not in st.session_state:
+    st.session_state.master_df = pd.DataFrame()
 
 # ==========================================
 # SIDEBAR: COMPANY HEADER & MASTER EXCEL
@@ -564,12 +575,12 @@ with st.sidebar:
         if st.button("📥 Load Master Excel Data", use_container_width=True):
             try:
                 xls = pd.ExcelFile(master_excel)
-                if "Invoice_Summary" in xls.sheet_names and "Challan_Dispatch_Details" in xls.sheet_names:
-                    st.session_state.summary_df = pd.read_excel(xls, sheet_name="Invoice_Summary")
-                    st.session_state.dispatch_df = pd.read_excel(xls, sheet_name="Challan_Dispatch_Details")
-                    st.success(f"✅ {len(st.session_state.summary_df)} purane invoices load ho gaye!")
+                if "Master_Invoice_Data" in xls.sheet_names:
+                    st.session_state.master_df = pd.read_excel(xls, sheet_name="Master_Invoice_Data")
+                    bill_cnt = st.session_state.master_df["Bill No"].nunique()
+                    st.success(f"✅ {bill_cnt} purane invoices ({len(st.session_state.master_df)} rows) load ho gaye!")
                 else:
-                    st.error("Invalid Master Excel format.")
+                    st.error("Invalid Master Excel format. 'Master_Invoice_Data' sheet nahi mili.")
             except Exception as e:
                 st.error(f"Excel load karne me error aaya: {e}")
 
@@ -580,8 +591,7 @@ with st.sidebar:
     )
 
     if st.button("🗑️ Clear Current Session Data", use_container_width=True):
-        st.session_state.summary_df = pd.DataFrame()
-        st.session_state.dispatch_df = pd.DataFrame()
+        st.session_state.master_df = pd.DataFrame()
         st.rerun()
 
 # ==========================================
@@ -603,11 +613,11 @@ if uploaded_files:
             st.warning("Koi valid PDF file nahi mili.")
         else:
             existing_bills = set()
-            if not st.session_state.summary_df.empty and "Bill No" in st.session_state.summary_df.columns:
-                existing_bills = set(st.session_state.summary_df["Bill No"].astype(str).str.strip())
+            if not st.session_state.master_df.empty and "Bill No" in st.session_state.master_df.columns:
+                existing_bills = set(st.session_state.master_df["Bill No"].astype(str).str.strip())
 
-            new_summaries = []
-            new_dispatches = []
+            new_rows = []
+            added_bills_count = 0
             skipped_files = []
             error_files = []
 
@@ -616,23 +626,20 @@ if uploaded_files:
 
             for i, (fname, fbytes) in enumerate(pdf_items, start=1):
                 try:
-                    summary_row, dispatch_rows = parse_pdf_invoice(fbytes, fname, default_company_info)
-                    bill_no_str = str(summary_row["Bill No"]).strip()
+                    invoice_rows = parse_pdf_invoice(fbytes, fname, default_company_info)
+                    bill_no_str = str(invoice_rows[0]["Bill No"]).strip()
 
                     if bill_no_str in existing_bills and not overwrite_duplicates:
                         skipped_files.append(f"{fname} (Bill No: {bill_no_str})")
                     else:
                         if bill_no_str in existing_bills and overwrite_duplicates:
-                            st.session_state.summary_df = st.session_state.summary_df[
-                                st.session_state.summary_df["Bill No"].astype(str).str.strip() != bill_no_str
-                            ]
-                            st.session_state.dispatch_df = st.session_state.dispatch_df[
-                                st.session_state.dispatch_df["Bill No"].astype(str).str.strip() != bill_no_str
+                            st.session_state.master_df = st.session_state.master_df[
+                                st.session_state.master_df["Bill No"].astype(str).str.strip() != bill_no_str
                             ]
 
-                        new_summaries.append(summary_row)
-                        new_dispatches.extend(dispatch_rows)
+                        new_rows.extend(invoice_rows)
                         existing_bills.add(bill_no_str)
+                        added_bills_count += 1
 
                 except Exception as e:
                     error_files.append(f"{fname}: {e}")
@@ -643,27 +650,20 @@ if uploaded_files:
             status_text.empty()
             progress_bar.empty()
 
-            if new_summaries:
-                new_sum_df = pd.DataFrame(new_summaries)
-                new_disp_df = pd.DataFrame(new_dispatches)
-
-                st.session_state.summary_df = pd.concat(
-                    [st.session_state.summary_df, new_sum_df], ignore_index=True
-                )
-                st.session_state.dispatch_df = pd.concat(
-                    [st.session_state.dispatch_df, new_disp_df], ignore_index=True
+            if new_rows:
+                new_df = pd.DataFrame(new_rows)
+                st.session_state.master_df = pd.concat(
+                    [st.session_state.master_df, new_df], ignore_index=True
                 )
 
-                if "Bill No (Num)" in st.session_state.summary_df.columns:
-                    st.session_state.summary_df = st.session_state.summary_df.sort_values(
-                        by="Bill No (Num)", ascending=True
-                    ).reset_index(drop=True)
-                if "Bill No (Num)" in st.session_state.dispatch_df.columns:
-                    st.session_state.dispatch_df = st.session_state.dispatch_df.sort_values(
-                        by=["Bill No (Num)"], ascending=True
+                if "Bill No (Num)" in st.session_state.master_df.columns:
+                    st.session_state.master_df = st.session_state.master_df.sort_values(
+                        by="Bill No (Num)", ascending=True, kind="mergesort"
                     ).reset_index(drop=True)
 
-                st.success(f"✅ {len(new_summaries)} naye invoice turant extract aur add ho gaye!")
+                st.success(
+                    f"✅ {added_bills_count} naye invoice ({len(new_rows)} rows) turant extract aur add ho gaye!"
+                )
 
             if skipped_files:
                 st.info("⏭️ Ye duplicate invoices skip kiye gaye: " + ", ".join(skipped_files))
@@ -676,39 +676,40 @@ if uploaded_files:
 # ==========================================
 # DASHBOARD, MISSING INVOICE ALERT & EXPORT
 # ==========================================
-if not st.session_state.summary_df.empty:
+if not st.session_state.master_df.empty:
     st.divider()
 
-    missing_df = find_missing_invoices(st.session_state.summary_df)
+    missing_df = find_missing_invoices(st.session_state.master_df)
     if not missing_df.empty:
         missing_list = ", ".join(missing_df["Missing Bill No"].tolist())
         st.warning(f"⚠️ **Missing Invoice Notification:** Ye Bill Numbers sequence me missing hain: **{missing_list}**")
     else:
         st.success("✅ Koi bhi invoice number sequence me missing nahi hai!")
 
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Total Invoices", len(st.session_state.summary_df))
-    col2.metric("Total Trips / Entries", len(st.session_state.dispatch_df))
-    col3.metric("Total TON", f"{st.session_state.summary_df['Total TON'].sum():,.2f}")
-    col4.metric("Grand Total (₹)", f"₹ {st.session_state.summary_df['Grand Total'].sum():,.2f}")
+    total_invoices = st.session_state.master_df["Bill No"].nunique()
+    total_entries = len(st.session_state.master_df)
+    total_ton = st.session_state.master_df["TON"].sum()
+    grand_total = st.session_state.master_df["Invoice Grand Total"].sum()
 
-    tab1, tab2, tab3 = st.tabs(["📋 Invoice Summary", "🚚 Challan / Dispatch Details", "⚠️ Missing Invoices"])
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Total Invoices", total_invoices)
+    col2.metric("Total Trips / Entries", total_entries)
+    col3.metric("Total TON", f"{total_ton:,.2f}")
+    col4.metric("Grand Total (₹)", f"₹ {grand_total:,.2f}")
+
+    tab1, tab2 = st.tabs(["📊 Master Invoice & Dispatch Data", "⚠️ Missing Invoices"])
 
     with tab1:
-        st.dataframe(st.session_state.summary_df, use_container_width=True, hide_index=True)
+        st.dataframe(st.session_state.master_df, use_container_width=True, hide_index=True)
 
     with tab2:
-        st.dataframe(st.session_state.dispatch_df, use_container_width=True, hide_index=True)
-
-    with tab3:
         if missing_df.empty:
             st.write("No missing invoices found.")
         else:
             st.dataframe(missing_df, use_container_width=True, hide_index=True)
 
     excel_bytes = generate_excel_bytes(
-        st.session_state.summary_df,
-        st.session_state.dispatch_df,
+        st.session_state.master_df,
         missing_df,
     )
     st.download_button(
