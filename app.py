@@ -1,5 +1,7 @@
 import io
 import re
+import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import List, Optional
 
@@ -23,7 +25,7 @@ st.set_page_config(
 
 st.title("📄 Building Material Invoice PDF to Excel Extractor")
 st.caption(
-    "Multiple Invoice PDFs upload karein, purane Master Excel me naya data append karein, aur missing invoices ka alert payein."
+    "Multiple Invoice PDFs ya ek ZIP file upload karein, purane Master Excel me naya data append karein, aur missing invoices ka alert payein."
 )
 
 # ==========================================
@@ -143,14 +145,12 @@ def parse_invoice_with_gemini(pdf_bytes: bytes, api_key: str, model_name: str) -
 
 
 def process_extracted_invoice(inv: InvoiceData, source_filename: str):
-    """Converts extracted InvoiceData into Summary dict and Dispatch list with exact GST calculations."""
     state = normalize_state(inv.customer_state)
     is_maharashtra = state.lower() == "maharashtra"
     fy = get_financial_year(inv.invoice_date)
     bill_num_int = extract_bill_number_int(inv.bill_no)
     bill_no_clean = str(inv.bill_no).strip()
 
-    # Build metal -> rate map from summary_rates
     rate_map = {}
     for item in inv.summary_rates:
         if item.rate is not None:
@@ -160,7 +160,6 @@ def process_extracted_invoice(inv: InvoiceData, source_filename: str):
     total_ton = 0.0
     gross_amount = 0.0
 
-    # If dispatch_items exist, process each trip; otherwise fallback to summary_rates
     if inv.dispatch_items:
         for idx, d in enumerate(inv.dispatch_items, start=1):
             metal = normalize_metal(d.metal_type)
@@ -290,13 +289,27 @@ def process_extracted_invoice(inv: InvoiceData, source_filename: str):
     return summary_row, dispatch_rows
 
 
+def extract_pdfs_from_uploads(uploaded_files):
+    """Returns list of (filename, pdf_bytes) from uploaded PDFs and ZIP files."""
+    pdf_list = []
+    for f in uploaded_files:
+        name = f.name
+        if name.lower().endswith(".zip"):
+            with zipfile.ZipFile(io.BytesIO(f.read())) as zf:
+                for zname in zf.namelist():
+                    if zname.lower().endswith(".pdf") and not zname.startswith("__MACOSX"):
+                        clean_name = zname.split("/")[-1]
+                        pdf_list.append((clean_name, zf.read(zname)))
+        elif name.lower().endswith(".pdf"):
+            pdf_list.append((name, f.read()))
+    return pdf_list
+
+
 def find_missing_invoices(summary_df: pd.DataFrame) -> pd.DataFrame:
     if summary_df.empty or "Bill No (Num)" not in summary_df.columns:
         return pd.DataFrame(columns=["Missing Bill No", "Status"])
 
-    valid_nums = (
-        summary_df["Bill No (Num)"].dropna().astype(int).unique().tolist()
-    )
+    valid_nums = summary_df["Bill No (Num)"].dropna().astype(int).unique().tolist()
     if not valid_nums:
         return pd.DataFrame(columns=["Missing Bill No", "Status"])
 
@@ -381,9 +394,16 @@ with st.sidebar:
         help="Default latest model: gemini-3.8-flash",
     )
 
+    parallel_workers = st.slider(
+        "Processing Speed (Parallel PDFs)",
+        min_value=1,
+        max_value=8,
+        value=5,
+        help="Ek saath kitni PDFs process honi chahiye (5 recommended hai).",
+    )
+
     st.divider()
     st.subheader("1️⃣ Purana Master Excel Load Karein (Optional)")
-    st.caption("Agar aapke paas pehle ka extracted Excel hai, to yahan upload karein taaki naye bills usi me add ho jayein.")
     master_excel = st.file_uploader(
         "Upload Existing Master Excel (.xlsx)",
         type=["xlsx"],
@@ -399,7 +419,7 @@ with st.sidebar:
                     st.session_state.dispatch_df = pd.read_excel(xls, sheet_name="Challan_Dispatch_Details")
                     st.success(f"✅ {len(st.session_state.summary_df)} purane invoices load ho gaye!")
                 else:
-                    st.error("Invalid Master Excel format. 'Invoice_Summary' aur 'Challan_Dispatch_Details' sheets nahi mili.")
+                    st.error("Invalid Master Excel format.")
             except Exception as e:
                 st.error(f"Excel load karne me error aaya: {e}")
 
@@ -407,7 +427,6 @@ with st.sidebar:
     overwrite_duplicates = st.checkbox(
         "Duplicate Bill No. aane par overwrite karein",
         value=False,
-        help="Unchecked rakhne par pehle se extracted Bill No. skip ho jayega.",
     )
 
     if st.button("🗑️ Clear Current Session Data", use_container_width=True):
@@ -416,86 +435,109 @@ with st.sidebar:
         st.rerun()
 
 # ==========================================
-# MAIN AREA: UPLOAD NEW INVOICE PDFs
+# MAIN AREA: UPLOAD PDFs OR ZIP
 # ==========================================
-st.subheader("2️⃣ Naye Invoice PDFs Upload Karein (Single ya Multiple)")
-uploaded_pdfs = st.file_uploader(
-    "Invoice PDF files select karein",
-    type=["pdf"],
+st.subheader("2️⃣ Naye Invoice PDFs ya ZIP File Upload Karein")
+uploaded_files = st.file_uploader(
+    "PDFs select karein ya saari PDFs ki 1 ZIP file upload karein (Fastest)",
+    type=["pdf", "zip"],
     accept_multiple_files=True,
 )
 
-if uploaded_pdfs:
+if uploaded_files:
     if st.button("🚀 Extract & Update Excel Data", type="primary"):
         if not api_key:
             st.error("Kripya Sidebar me apna Gemini API Key daalein (ya Streamlit Secrets me set karein).")
         else:
-            existing_bills = set()
-            if not st.session_state.summary_df.empty and "Bill No" in st.session_state.summary_df.columns:
-                existing_bills = set(st.session_state.summary_df["Bill No"].astype(str).str.strip())
+            pdf_items = extract_pdfs_from_uploads(uploaded_files)
+            total_pdfs = len(pdf_items)
 
-            new_summaries = []
-            new_dispatches = []
-            skipped_files = []
+            if total_pdfs == 0:
+                st.warning("Koi valid PDF file nahi mili.")
+            else:
+                existing_bills = set()
+                if not st.session_state.summary_df.empty and "Bill No" in st.session_state.summary_df.columns:
+                    existing_bills = set(st.session_state.summary_df["Bill No"].astype(str).str.strip())
 
-            progress_bar = st.progress(0)
-            status_text = st.empty()
+                new_summaries = []
+                new_dispatches = []
+                skipped_files = []
+                error_files = []
 
-            for i, pdf_file in enumerate(uploaded_pdfs):
-                status_text.text(f"Processing ({i + 1}/{len(uploaded_pdfs)}): {pdf_file.name}...")
-                try:
-                    pdf_bytes = pdf_file.read()
-                    inv_data = parse_invoice_with_gemini(pdf_bytes, api_key, model_name.strip())
-                    bill_no_str = str(inv_data.bill_no).strip()
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                status_text.text(f"0/{total_pdfs} PDFs processed ({parallel_workers} parallel workers active)...")
 
-                    if bill_no_str in existing_bills and not overwrite_duplicates:
-                        skipped_files.append(f"{pdf_file.name} (Bill No: {bill_no_str})")
-                    else:
-                        if bill_no_str in existing_bills and overwrite_duplicates:
-                            st.session_state.summary_df = st.session_state.summary_df[
-                                st.session_state.summary_df["Bill No"].astype(str).str.strip() != bill_no_str
-                            ]
-                            st.session_state.dispatch_df = st.session_state.dispatch_df[
-                                st.session_state.dispatch_df["Bill No"].astype(str).str.strip() != bill_no_str
-                            ]
+                completed_count = 0
 
-                        summary_row, dispatch_rows = process_extracted_invoice(inv_data, pdf_file.name)
-                        new_summaries.append(summary_row)
-                        new_dispatches.extend(dispatch_rows)
-                        existing_bills.add(bill_no_str)
+                def worker(item):
+                    fname, fbytes = item
+                    inv = parse_invoice_with_gemini(fbytes, api_key, model_name.strip())
+                    return fname, inv
 
-                except Exception as e:
-                    st.error(f"❌ Error in {pdf_file.name}: {e}")
+                with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
+                    future_to_name = {executor.submit(worker, item): item[0] for item in pdf_items}
+                    for future in as_completed(future_to_name):
+                        fname = future_to_name[future]
+                        completed_count += 1
+                        try:
+                            _, inv_data = future.result()
+                            bill_no_str = str(inv_data.bill_no).strip()
 
-                progress_bar.progress((i + 1) / len(uploaded_pdfs))
+                            if bill_no_str in existing_bills and not overwrite_duplicates:
+                                skipped_files.append(f"{fname} (Bill No: {bill_no_str})")
+                            else:
+                                if bill_no_str in existing_bills and overwrite_duplicates:
+                                    st.session_state.summary_df = st.session_state.summary_df[
+                                        st.session_state.summary_df["Bill No"].astype(str).str.strip() != bill_no_str
+                                    ]
+                                    st.session_state.dispatch_df = st.session_state.dispatch_df[
+                                        st.session_state.dispatch_df["Bill No"].astype(str).str.strip() != bill_no_str
+                                    ]
 
-            status_text.empty()
-            progress_bar.empty()
+                                summary_row, dispatch_rows = process_extracted_invoice(inv_data, fname)
+                                new_summaries.append(summary_row)
+                                new_dispatches.extend(dispatch_rows)
+                                existing_bills.add(bill_no_str)
 
-            if new_summaries:
-                new_sum_df = pd.DataFrame(new_summaries)
-                new_disp_df = pd.DataFrame(new_dispatches)
+                        except Exception as e:
+                            error_files.append(f"{fname}: {e}")
 
-                st.session_state.summary_df = pd.concat(
-                    [st.session_state.summary_df, new_sum_df], ignore_index=True
-                )
-                st.session_state.dispatch_df = pd.concat(
-                    [st.session_state.dispatch_df, new_disp_df], ignore_index=True
-                )
+                        progress_bar.progress(completed_count / total_pdfs)
+                        status_text.text(f"Processed {completed_count}/{total_pdfs}: {fname}")
 
-                if "Bill No (Num)" in st.session_state.summary_df.columns:
-                    st.session_state.summary_df = st.session_state.summary_df.sort_values(
-                        by="Bill No (Num)", ascending=True
-                    ).reset_index(drop=True)
-                if "Bill No (Num)" in st.session_state.dispatch_df.columns:
-                    st.session_state.dispatch_df = st.session_state.dispatch_df.sort_values(
-                        by=["Bill No (Num)"], ascending=True
-                    ).reset_index(drop=True)
+                status_text.empty()
+                progress_bar.empty()
 
-                st.success(f"✅ {len(new_summaries)} naye invoice successfully extract aur add ho gaye!")
+                if new_summaries:
+                    new_sum_df = pd.DataFrame(new_summaries)
+                    new_disp_df = pd.DataFrame(new_dispatches)
 
-            if skipped_files:
-                st.info("⏭️ Ye duplicate invoices skip kiye gaye: " + ", ".join(skipped_files))
+                    st.session_state.summary_df = pd.concat(
+                        [st.session_state.summary_df, new_sum_df], ignore_index=True
+                    )
+                    st.session_state.dispatch_df = pd.concat(
+                        [st.session_state.dispatch_df, new_disp_df], ignore_index=True
+                    )
+
+                    if "Bill No (Num)" in st.session_state.summary_df.columns:
+                        st.session_state.summary_df = st.session_state.summary_df.sort_values(
+                            by="Bill No (Num)", ascending=True
+                        ).reset_index(drop=True)
+                    if "Bill No (Num)" in st.session_state.dispatch_df.columns:
+                        st.session_state.dispatch_df = st.session_state.dispatch_df.sort_values(
+                            by=["Bill No (Num)"], ascending=True
+                        ).reset_index(drop=True)
+
+                    st.success(f"✅ {len(new_summaries)} naye invoice successfully extract aur add ho gaye!")
+
+                if skipped_files:
+                    st.info("⏭️ Ye duplicate invoices skip kiye gaye: " + ", ".join(skipped_files))
+
+                if error_files:
+                    with st.expander(f"❌ {len(error_files)} files me error aaya (click karke dekhein)"):
+                        for err in error_files:
+                            st.write(err)
 
 # ==========================================
 # DASHBOARD, MISSING INVOICE ALERT & EXPORT
