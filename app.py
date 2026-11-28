@@ -378,7 +378,6 @@ def parse_pdf_invoice(
                 "Company Name": company_name,
                 "Company GSTIN": default_company_info["company_gstin"],
                 "Company PAN": default_company_info["company_pan"],
-                "Company Details": default_company_info["company_details"],
                 "Bill To Name": bill_to_name,
                 "Bill To Address": bill_to_address,
                 "Shipping Address": shipping_address,
@@ -386,9 +385,7 @@ def parse_pdf_invoice(
                 "Customer State": customer_state,
                 "HSN Code": hsn_code,
                 "Sr. No.": "",
-                "Dispatch Date": "",
-                "Challan No": "",
-                "Vehicle No": "",
+                "Remark": "",
                 "Metal Type": "",
                 "TON": 0.0,
                 "Rate": 0.0,
@@ -420,6 +417,14 @@ def parse_pdf_invoice(
 
         line_total = round(line_amount + cgst + sgst + igst, 2)
 
+        # Combine Dispatch Date - Challan No - Vehicle No into Remark
+        remark_parts = [
+            str(p).strip()
+            for p in (item["dispatch_date"], item["challan_no"], item["vehicle_no"])
+            if str(p).strip()
+        ]
+        remark_str = " - ".join(remark_parts)
+
         combined_rows.append(
             {
                 "Financial Year": fy,
@@ -429,7 +434,6 @@ def parse_pdf_invoice(
                 "Company Name": company_name,
                 "Company GSTIN": default_company_info["company_gstin"],
                 "Company PAN": default_company_info["company_pan"],
-                "Company Details": default_company_info["company_details"],
                 "Bill To Name": bill_to_name,
                 "Bill To Address": bill_to_address,
                 "Shipping Address": shipping_address,
@@ -437,9 +441,7 @@ def parse_pdf_invoice(
                 "Customer State": customer_state,
                 "HSN Code": hsn_code,
                 "Sr. No.": item["sr_no"],
-                "Dispatch Date": item["dispatch_date"],
-                "Challan No": item["challan_no"],
-                "Vehicle No": item["vehicle_no"],
+                "Remark": remark_str,
                 "Metal Type": item["metal_type"],
                 "TON": round(ton, 2),
                 "Rate": round(rate, 2),
@@ -461,17 +463,22 @@ def parse_pdf_invoice(
 # FAST FILE LOADERS (GOOGLE DRIVE & UPLOAD)
 # ==========================================
 def download_from_gdrive(url: str) -> List[Tuple[str, bytes]]:
-    """Downloads a ZIP or PDF from Google Drive server-to-server in 1-2 seconds."""
     pdf_list = []
     with tempfile.TemporaryDirectory() as tmpdir:
-        out_path = gdown.download(url=url.strip(), output=os.path.join(tmpdir, "downloaded_file"), quiet=True, fuzzy=True)
+        out_path = gdown.download(
+            url=url.strip(),
+            output=os.path.join(tmpdir, "downloaded_file"),
+            quiet=True,
+            fuzzy=True,
+        )
         if not out_path or not os.path.exists(out_path):
-            raise ValueError("Google Drive se file download nahi ho payi. Check karein ki link 'Anyone with the link' par set hai.")
+            raise ValueError(
+                "Google Drive se file download nahi ho payi. Check karein ki link 'Anyone with the link' par set hai."
+            )
 
         with open(out_path, "rb") as f:
             raw_bytes = f.read()
 
-        # Check if ZIP file (magic bytes PK)
         if raw_bytes[:2] == b"PK":
             with zipfile.ZipFile(io.BytesIO(raw_bytes)) as zf:
                 for zname in zf.namelist():
@@ -651,21 +658,15 @@ if "master_df" not in st.session_state:
 # SIDEBAR: COMPANY HEADER & MASTER EXCEL
 # ==========================================
 with st.sidebar:
-    st.header("🏢 Company Header Details")
+    st.header("🏢 Company Header")
     comp_name = st.text_input("Company Name", value="SAIKRUPA ENTERPRISES")
     comp_gstin = st.text_input("Company GSTIN", value="27AZRPP3943M1ZH")
     comp_pan = st.text_input("Company PAN", value="AZRPP3943M")
-    comp_details = st.text_area(
-        "Company Address & Contact",
-        value="Water & Building Material Suppliers, At. Khandwal, Post. Amane, Tal. Bhiwandi, Dist. Thane. | Dinesh Patil: 9049855858 / 9881210811",
-        height=90,
-    )
 
     default_company_info = {
         "company_name": comp_name.strip(),
         "company_gstin": comp_gstin.strip(),
         "company_pan": comp_pan.strip(),
-        "company_details": comp_details.strip(),
     }
 
     st.divider()
