@@ -3,6 +3,7 @@ import os
 import re
 import tempfile
 import zipfile
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
@@ -26,7 +27,7 @@ st.set_page_config(
 
 st.title("⚡ Building Material Invoice PDF to Excel Extractor")
 st.caption(
-    "Google Drive Fast Import • Zero API Key • Single Master Sheet • Missing Invoice Alert"
+    "1 Invoice = 1 Row • Combined Remark (Disp Date - Ch No - Veh No) • Google Drive Fast Import • Missing Invoice Alert"
 )
 
 # ==========================================
@@ -90,13 +91,13 @@ def get_financial_year(date_str: str) -> str:
 
 
 # ==========================================
-# DIRECT PYTHON PDF PARSER (COMBINED ROWS)
+# DIRECT PYTHON PDF PARSER (1 ROW PER INVOICE)
 # ==========================================
 def parse_pdf_invoice(
     pdf_bytes: bytes,
     source_filename: str,
     default_company_info: Dict[str, str],
-) -> List[dict]:
+) -> dict:
     reader = PdfReader(io.BytesIO(pdf_bytes))
     if not reader.pages:
         raise ValueError("PDF me koi page nahi mila.")
@@ -261,7 +262,6 @@ def parse_pdf_invoice(
                 summary_rates[metal_norm] = to_float(rate)
                 p1_dispatch_rows.append(
                     {
-                        "sr_no": str(len(p1_dispatch_rows) + 1),
                         "dispatch_date": parse_date_ddmmyyyy(d_date),
                         "challan_no": (challan or "").strip(),
                         "vehicle_no": re.sub(r"\s+", " ", veh.strip().upper()),
@@ -283,7 +283,6 @@ def parse_pdf_invoice(
                 summary_rates[metal_norm] = to_float(rate)
                 p1_dispatch_rows.append(
                     {
-                        "sr_no": str(len(p1_dispatch_rows) + 1),
                         "dispatch_date": parse_date_ddmmyyyy(d_date),
                         "challan_no": (challan or "").strip(),
                         "vehicle_no": re.sub(r"\s+", " ", veh.strip().upper()),
@@ -306,7 +305,6 @@ def parse_pdf_invoice(
                 summary_rates[metal_norm] = to_float(rate)
                 p1_summary_rows.append(
                     {
-                        "sr_no": str(len(p1_summary_rows) + 1),
                         "dispatch_date": invoice_date,
                         "challan_no": "",
                         "vehicle_no": "",
@@ -331,11 +329,10 @@ def parse_pdf_invoice(
                 re.IGNORECASE,
             )
             if m_p2:
-                sr, d_date, challan, veh, metal, ton = m_p2.groups()
+                _, d_date, challan, veh, metal, ton = m_p2.groups()
                 metal_norm = normalize_metal(metal)
                 p2_dispatch_rows.append(
                     {
-                        "sr_no": sr.strip(),
                         "dispatch_date": parse_date_ddmmyyyy(d_date),
                         "challan_no": (challan or "").strip(),
                         "vehicle_no": re.sub(r"\s+", " ", veh.strip().upper()),
@@ -347,13 +344,50 @@ def parse_pdf_invoice(
 
     raw_items = p2_dispatch_rows or p1_dispatch_rows or p1_summary_rows
 
-    # 7. Calculate Totals & Build Combined Rows
+    # 7. Combine All Trips into 1 Remark Cell & Summarize Metal Details
+    remark_entries = []
+    metal_agg = defaultdict(lambda: {"ton": 0.0, "rate": 0.0, "amount": 0.0})
+    total_ton = 0.0
+    inv_gross = 0.0
+
+    for item in raw_items:
+        ton = float(item["ton"])
+        rate = float(item["rate"])
+        amt = round(ton * rate, 2)
+        total_ton += ton
+        inv_gross += amt
+
+        m_type = item["metal_type"]
+        metal_agg[m_type]["ton"] += ton
+        metal_agg[m_type]["rate"] = rate
+        metal_agg[m_type]["amount"] += amt
+
+        parts = [
+            str(p).strip()
+            for p in (item["dispatch_date"], item["challan_no"], item["vehicle_no"])
+            if str(p).strip()
+        ]
+        if parts:
+            remark_entries.append(" - ".join(parts))
+
+    combined_remark = " | ".join(remark_entries)
+
+    metal_types_str = ", ".join(metal_agg.keys())
+    metal_details_parts = []
+    for m_type, vals in metal_agg.items():
+        m_ton = round(vals["ton"], 2)
+        m_rate = round(vals["rate"], 2)
+        m_amt = round(vals["amount"], 2)
+        metal_details_parts.append(f"{m_type}: {m_ton} TON @ {m_rate} = {m_amt}")
+    metal_details_str = " | ".join(metal_details_parts)
+
+    # 8. GST Calculations (Maharashtra: 2.5% CGST + 2.5% SGST | Other State: 5% IGST)
     is_maharashtra = customer_state.lower() == "maharashtra"
     fy = get_financial_year(invoice_date)
     bill_num_int = extract_bill_number_int(bill_no)
     bill_no_clean = str(bill_no).strip()
 
-    inv_gross = round(sum(round(float(x["ton"]) * float(x["rate"]), 2) for x in raw_items), 2)
+    inv_gross = round(inv_gross, 2)
     if is_maharashtra:
         inv_cgst = round(inv_gross * 0.025, 2)
         inv_sgst = round(inv_gross * 0.025, 2)
@@ -367,96 +401,33 @@ def parse_pdf_invoice(
     inv_grand_total = float(round(raw_total))
     inv_round_off = round(inv_grand_total - raw_total, 2)
 
-    combined_rows = []
-    if not raw_items:
-        combined_rows.append(
-            {
-                "Financial Year": fy,
-                "Bill No": bill_no_clean,
-                "Bill No (Num)": bill_num_int,
-                "Invoice Date": invoice_date,
-                "Company Name": company_name,
-                "Company GSTIN": default_company_info["company_gstin"],
-                "Company PAN": default_company_info["company_pan"],
-                "Bill To Name": bill_to_name,
-                "Bill To Address": bill_to_address,
-                "Shipping Address": shipping_address,
-                "Customer GST/PAN": customer_gst_pan,
-                "Customer State": customer_state,
-                "HSN Code": hsn_code,
-                "Sr. No.": "",
-                "Remark": "",
-                "Metal Type": "",
-                "TON": 0.0,
-                "Rate": 0.0,
-                "Amount (TON x Rate)": 0.0,
-                "CGST (2.5%)": 0.0,
-                "SGST (2.5%)": 0.0,
-                "IGST (5%)": 0.0,
-                "Line Total": 0.0,
-                "Invoice Round Off": 0.0,
-                "Invoice Grand Total": 0.0,
-                "Source File": source_filename,
-            }
-        )
-        return combined_rows
-
-    for idx, item in enumerate(raw_items):
-        ton = float(item["ton"])
-        rate = float(item["rate"])
-        line_amount = round(ton * rate, 2)
-
-        if is_maharashtra:
-            cgst = round(line_amount * 0.025, 2)
-            sgst = round(line_amount * 0.025, 2)
-            igst = 0.0
-        else:
-            cgst = 0.0
-            sgst = 0.0
-            igst = round(line_amount * 0.05, 2)
-
-        line_total = round(line_amount + cgst + sgst + igst, 2)
-
-        # Combine Dispatch Date - Challan No - Vehicle No into Remark
-        remark_parts = [
-            str(p).strip()
-            for p in (item["dispatch_date"], item["challan_no"], item["vehicle_no"])
-            if str(p).strip()
-        ]
-        remark_str = " - ".join(remark_parts)
-
-        combined_rows.append(
-            {
-                "Financial Year": fy,
-                "Bill No": bill_no_clean,
-                "Bill No (Num)": bill_num_int,
-                "Invoice Date": invoice_date,
-                "Company Name": company_name,
-                "Company GSTIN": default_company_info["company_gstin"],
-                "Company PAN": default_company_info["company_pan"],
-                "Bill To Name": bill_to_name,
-                "Bill To Address": bill_to_address,
-                "Shipping Address": shipping_address,
-                "Customer GST/PAN": customer_gst_pan,
-                "Customer State": customer_state,
-                "HSN Code": hsn_code,
-                "Sr. No.": item["sr_no"],
-                "Remark": remark_str,
-                "Metal Type": item["metal_type"],
-                "TON": round(ton, 2),
-                "Rate": round(rate, 2),
-                "Amount (TON x Rate)": line_amount,
-                "CGST (2.5%)": cgst,
-                "SGST (2.5%)": sgst,
-                "IGST (5%)": igst,
-                "Line Total": line_total,
-                "Invoice Round Off": inv_round_off if idx == 0 else None,
-                "Invoice Grand Total": inv_grand_total if idx == 0 else None,
-                "Source File": source_filename,
-            }
-        )
-
-    return combined_rows
+    return {
+        "Financial Year": fy,
+        "Bill No": bill_no_clean,
+        "Bill No (Num)": bill_num_int,
+        "Invoice Date": invoice_date,
+        "Company Name": company_name,
+        "Company GSTIN": default_company_info["company_gstin"],
+        "Company PAN": default_company_info["company_pan"],
+        "Bill To Name": bill_to_name,
+        "Bill To Address": bill_to_address,
+        "Shipping Address": shipping_address,
+        "Customer GST/PAN": customer_gst_pan,
+        "Customer State": customer_state,
+        "HSN Code": hsn_code,
+        "Remark (Disp Date - Ch No - Veh No)": combined_remark,
+        "Total Trips": len(raw_items),
+        "Metal Type": metal_types_str,
+        "Metal Details (TON @ Rate = Amount)": metal_details_str,
+        "Total TON": round(total_ton, 2),
+        "Gross Amount": inv_gross,
+        "CGST (2.5%)": inv_cgst,
+        "SGST (2.5%)": inv_sgst,
+        "IGST (5%)": inv_igst,
+        "Round Off": inv_round_off,
+        "Grand Total": inv_grand_total,
+        "Source File": source_filename,
+    }
 
 
 # ==========================================
@@ -525,7 +496,6 @@ def process_pdf_batch(
         existing_bills = set(st.session_state.master_df["Bill No"].astype(str).str.strip())
 
     new_rows = []
-    added_bills_count = 0
     skipped_files = []
     error_files = []
 
@@ -552,12 +522,12 @@ def process_pdf_batch(
 
     parsed_results.sort(key=lambda x: x[0])
 
-    for fname, invoice_rows, err in parsed_results:
+    for fname, invoice_row, err in parsed_results:
         if err:
             error_files.append(f"{fname}: {err}")
             continue
 
-        bill_no_str = str(invoice_rows[0]["Bill No"]).strip()
+        bill_no_str = str(invoice_row["Bill No"]).strip()
         if bill_no_str in existing_bills and not overwrite_duplicates:
             skipped_files.append(f"{fname} (Bill No: {bill_no_str})")
         else:
@@ -565,9 +535,8 @@ def process_pdf_batch(
                 st.session_state.master_df = st.session_state.master_df[
                     st.session_state.master_df["Bill No"].astype(str).str.strip() != bill_no_str
                 ]
-            new_rows.extend(invoice_rows)
+            new_rows.append(invoice_row)
             existing_bills.add(bill_no_str)
-            added_bills_count += 1
 
     if new_rows:
         new_df = pd.DataFrame(new_rows)
@@ -579,7 +548,7 @@ def process_pdf_batch(
                 by="Bill No (Num)", ascending=True, kind="mergesort"
             ).reset_index(drop=True)
 
-        st.success(f"✅ {added_bills_count} naye invoice ({len(new_rows)} rows) turbo speed se add ho gaye!")
+        st.success(f"✅ {len(new_rows)} naye invoice (1 row per invoice) turant add ho gaye!")
 
     if skipped_files:
         st.info("⏭️ Duplicate invoices skip kiye gaye: " + ", ".join(skipped_files))
@@ -636,6 +605,7 @@ def generate_excel_bytes(master_df: pd.DataFrame, missing_df: pd.DataFrame) -> b
                 cell.alignment = Alignment(horizontal="center", vertical="center")
 
             for col_idx, col_cells in enumerate(ws.columns, start=1):
+                header_val = str(col_cells[0].value or "")
                 max_len = 0
                 for cell in col_cells:
                     val = str(cell.value) if cell.value is not None else ""
@@ -643,7 +613,13 @@ def generate_excel_bytes(master_df: pd.DataFrame, missing_df: pd.DataFrame) -> b
                         max_len = len(val)
                     if sheet_name == "Missing_Invoices" and cell.row > 1:
                         cell.fill = alert_fill
-                ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 4, 42)
+                    if cell.row > 1 and ("Remark" in header_val or "Metal Details" in header_val):
+                        cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+                if "Remark" in header_val or "Metal Details" in header_val:
+                    ws.column_dimensions[get_column_letter(col_idx)].width = 50
+                else:
+                    ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 4, 38)
 
     return output.getvalue()
 
@@ -683,8 +659,7 @@ with st.sidebar:
             xls = pd.ExcelFile(master_excel)
             if "Master_Invoice_Data" in xls.sheet_names:
                 st.session_state.master_df = pd.read_excel(xls, sheet_name="Master_Invoice_Data")
-                bill_cnt = st.session_state.master_df["Bill No"].nunique()
-                st.success(f"✅ {bill_cnt} purane invoices load ho gaye!")
+                st.success(f"✅ {len(st.session_state.master_df)} purane invoices load ho gaye!")
             else:
                 st.error("'Master_Invoice_Data' sheet nahi mili.")
         except Exception as e:
@@ -763,18 +738,18 @@ if not st.session_state.master_df.empty:
     else:
         st.success("✅ Koi bhi invoice number sequence me missing nahi hai!")
 
-    total_invoices = st.session_state.master_df["Bill No"].nunique()
-    total_entries = len(st.session_state.master_df)
-    total_ton = st.session_state.master_df["TON"].sum()
-    grand_total = st.session_state.master_df["Invoice Grand Total"].sum()
+    total_invoices = len(st.session_state.master_df)
+    total_trips = int(st.session_state.master_df["Total Trips"].sum())
+    total_ton = st.session_state.master_df["Total TON"].sum()
+    grand_total = st.session_state.master_df["Grand Total"].sum()
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Total Invoices", total_invoices)
-    col2.metric("Total Trips / Entries", total_entries)
+    col2.metric("Total Trips", total_trips)
     col3.metric("Total TON", f"{total_ton:,.2f}")
     col4.metric("Grand Total (₹)", f"₹ {grand_total:,.2f}")
 
-    tab1, tab2 = st.tabs(["📊 Master Invoice & Dispatch Data", "⚠️ Missing Invoices"])
+    tab1, tab2 = st.tabs(["📊 Master Invoice Data (1 Row / Bill)", "⚠️ Missing Invoices"])
 
     with tab1:
         st.dataframe(st.session_state.master_df, use_container_width=True, hide_index=True)
